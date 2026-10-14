@@ -100,7 +100,6 @@ def get_ssh_active_sessions() -> Dict[str, List[Tuple[int, str]]]:
                 continue
             peer_addr = cols[4]
             proc_info = " ".join(cols[5:])
-            # Extract IPv4/IPv6 and port
             if peer_addr.startswith("["):
                 ip_part, port_part = peer_addr.rsplit(":", 1)
                 ip_part = ip_part.strip("[]")
@@ -141,25 +140,24 @@ def get_ssh_active_sessions() -> Dict[str, List[Tuple[int, str]]]:
 
 def get_xray_active_sessions(window_seconds: int = 90) -> Dict[str, Tuple[int, Set[str]]]:
     """
-    Parses /var/log/xray/access.log for recent accepted lines within `window_seconds`.
+    Parses /var/log/xray/access.log for recent accepted lines within `window_seconds`,
+    resolving 127.0.0.1 ephemeral ports through /run/vps-panel/ws_sessions.json when needed.
     Returns {username: (connection_count, {set_of_unique_ips})}.
-    Xray log line format:
-      2026/10/15 04:10:12 from 203.0.113.5:51234 accepted tcp:1.1.1.1:443 [inbound -> direct] email: alice@vless
     """
     results: Dict[str, Tuple[int, Set[str]]] = {}
     if not os.path.exists(XRAY_ACCESS_LOG):
         return results
 
+    ws_map = load_ws_sessions()
     now = time.time()
     conn_counts: Dict[str, int] = defaultdict(int)
     user_ips: Dict[str, Set[str]] = defaultdict(set)
 
     line_re = re.compile(
-        r"^(\d{4}/\d{2}/\d{2}\s+\d{2}:\d{2}:\d{2}).*?from\s+(?:tcp:)?([0-9a-fA-F\.:]+):\d+\s+accepted.*?email:\s+([^\s@]+)"
+        r"^(\d{4}/\d{2}/\d{2}\s+\d{2}:\d{2}:\d{2}).*?from\s+(?:tcp:)?([0-9a-fA-F\.:]+):(\d+)\s+accepted.*?email:\s+([^\s@]+)"
     )
 
     try:
-        # Read last 2000 lines for speed
         out = subprocess.check_output(
             ["tail", "-n", "2000", XRAY_ACCESS_LOG], text=True, stderr=subprocess.DEVNULL
         )
@@ -167,13 +165,17 @@ def get_xray_active_sessions(window_seconds: int = 90) -> Dict[str, Tuple[int, S
             m = line_re.search(line)
             if not m:
                 continue
-            ts_str, client_ip, username = m.group(1), m.group(2), m.group(3)
+            ts_str, client_ip, src_port, username = m.group(1), m.group(2), m.group(3), m.group(4)
+            if username == "default":
+                continue
             try:
                 ts = time.mktime(time.strptime(ts_str, "%Y/%m/%d %H:%M:%S"))
                 if now - ts > window_seconds:
                     continue
             except Exception:
                 pass
+            if client_ip == "127.0.0.1" and src_port in ws_map:
+                client_ip = ws_map[src_port].get("client_ip", "127.0.0.1")
             if client_ip != "127.0.0.1":
                 conn_counts[username] += 1
                 user_ips[username].add(client_ip)
@@ -194,7 +196,6 @@ def block_client_ip(client_ip: str, duration_sec: int = 120) -> None:
                 blocked = json.load(f)
         except Exception:
             blocked = {}
-    # Clean expired blocks
     now = time.time()
     blocked = {ip: exp for ip, exp in blocked.items() if exp > now}
     blocked[client_ip] = now + duration_sec
@@ -218,7 +219,6 @@ def enforce_once() -> None:
         for pid, cip in sessions:
             if cip not in seen_ips:
                 seen_ips.append(cip)
-            # Enforce both unique IP limit and total concurrent session limit
             if len(seen_ips) > max_ip or len(sessions) > max_ip * 2:
                 try:
                     os.kill(pid, 9)
