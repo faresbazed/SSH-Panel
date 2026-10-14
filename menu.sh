@@ -4,6 +4,7 @@
 # Supports:
 #   - SSH & SSH-WS (Port 80 Custom Payload) & SSH-SSL (Port 443 All TLS 1.0-1.3)
 #   - Xray-core (VLESS, VMess, Trojan over WebSocket & TCP on Ports 443 & 80)
+#   - Custom SNI / Bug Host support for both SSL/TLS and Xray links
 #   - BadVPN UDPGW (Port 7300)
 #   - User Validity (Days), Expiration Cron, User Deletion, Per-User IP Limiter
 #   - Service Status Monitor & Port Conflict / Exclusive Mode Switcher
@@ -16,6 +17,7 @@ SSH_DB="${CONFIG_DIR}/ssh-users.db"
 XRAY_DB="${CONFIG_DIR}/xray-users.db"
 PORT_MODE_FILE="${CONFIG_DIR}/port_mode.conf"
 DOMAIN_FILE="${CONFIG_DIR}/domain"
+SNI_FILE="${CONFIG_DIR}/custom_sni"
 XRAY_CONFIG="/usr/local/etc/xray/config.json"
 CERT_FILE="${CONFIG_DIR}/ssl/fullchain.pem"
 KEY_FILE="${CONFIG_DIR}/ssl/privkey.pem"
@@ -35,7 +37,15 @@ get_host() {
     if [[ -s "${DOMAIN_FILE}" ]]; then
         cat "${DOMAIN_FILE}"
     else
-        curl -fsSL4 icanhazip.com 2>/dev/null || hostname -I | awk '{print $1}'
+        curl -fsSL4 --max-time 2 icanhazip.com 2>/dev/null || hostname -I | awk '{print $1}'
+    fi
+}
+
+get_default_sni() {
+    if [[ -s "${SNI_FILE}" ]]; then
+        cat "${SNI_FILE}"
+    else
+        get_host
     fi
 }
 
@@ -64,7 +74,158 @@ get_port_mode_label() {
 }
 
 # -----------------------------------------------------------------------------
-# SSH User Management
+# Repair / Re-initialize Xray Service & Config if Inactive
+# -----------------------------------------------------------------------------
+repair_xray_service() {
+    mkdir -p /var/log/xray /etc/systemd/system/xray.service.d
+    chmod -R 755 /var/log/xray
+    touch /var/log/xray/access.log /var/log/xray/error.log
+    chmod 666 /var/log/xray/access.log /var/log/xray/error.log
+
+    # Force Xray systemd service to run as root so it never fails on log/socket permissions
+    cat > /etc/systemd/system/xray.service.d/10-root-override.conf <<'EOF'
+[Service]
+User=root
+Group=root
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+NoNewPrivileges=false
+EOF
+
+    # Ensure config.json is valid and has at least one seed client per inbound
+    if [[ ! -s "${XRAY_CONFIG}" ]] || ! /usr/local/bin/xray run -test -config "${XRAY_CONFIG}" >/dev/null 2>&1; then
+        local seed_uuid
+        seed_uuid=$(cat /proc/sys/kernel/random/uuid)
+        cat > "${XRAY_CONFIG}" <<EOF
+{
+  "log": {
+    "access": "/var/log/xray/access.log",
+    "error": "/var/log/xray/error.log",
+    "loglevel": "info"
+  },
+  "inbounds": [
+    {
+      "tag": "vless-ws",
+      "listen": "127.0.0.1",
+      "port": 10001,
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {"id": "${seed_uuid}", "email": "default@vless"}
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "ws",
+        "wsSettings": {
+          "path": "/vless"
+        }
+      }
+    },
+    {
+      "tag": "vmess-ws",
+      "listen": "127.0.0.1",
+      "port": 10002,
+      "protocol": "vmess",
+      "settings": {
+        "clients": [
+          {"id": "${seed_uuid}", "alterId": 0, "email": "default@vmess"}
+        ]
+      },
+      "streamSettings": {
+        "network": "ws",
+        "wsSettings": {
+          "path": "/vmess"
+        }
+      }
+    },
+    {
+      "tag": "trojan-ws",
+      "listen": "127.0.0.1",
+      "port": 10003,
+      "protocol": "trojan",
+      "settings": {
+        "clients": [
+          {"password": "${seed_uuid}", "email": "default@trojan"}
+        ]
+      },
+      "streamSettings": {
+        "network": "ws",
+        "wsSettings": {
+          "path": "/trojan"
+        }
+      }
+    },
+    {
+      "tag": "vless-tcp",
+      "listen": "127.0.0.1",
+      "port": 10004,
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {"id": "${seed_uuid}", "email": "default@vless"}
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "tcp"
+      }
+    },
+    {
+      "tag": "vmess-tcp",
+      "listen": "127.0.0.1",
+      "port": 10005,
+      "protocol": "vmess",
+      "settings": {
+        "clients": [
+          {"id": "${seed_uuid}", "alterId": 0, "email": "default@vmess"}
+        ]
+      },
+      "streamSettings": {
+        "network": "tcp"
+      }
+    },
+    {
+      "tag": "trojan-tcp",
+      "listen": "127.0.0.1",
+      "port": 10006,
+      "protocol": "trojan",
+      "settings": {
+        "clients": [
+          {"password": "${seed_uuid}", "email": "default@trojan"}
+        ]
+      },
+      "streamSettings": {
+        "network": "tcp"
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "protocol": "freedom",
+      "tag": "direct"
+    },
+    {
+      "protocol": "blackhole",
+      "tag": "blocked"
+    }
+  ]
+}
+EOF
+    fi
+
+    systemctl daemon-reload
+    systemctl enable xray 2>/dev/null || true
+    systemctl restart xray 2>/dev/null || true
+}
+
+# Auto-heal Xray on menu launch if inactive
+if ! systemctl is-active --quiet xray 2>/dev/null; then
+    repair_xray_service
+fi
+
+# -----------------------------------------------------------------------------
+# SSH User Management (with Custom SNI / Bug Host Support)
 # -----------------------------------------------------------------------------
 create_ssh_user() {
     echo -e "\n${CYAN}--- Create SSH / SSH-WS / SSL User ---${NC}"
@@ -81,6 +242,11 @@ create_ssh_user() {
     read -rp "Validity (days, e.g. 30): " days
     read -rp "Max Concurrent IPs (e.g. 2): " max_ip
 
+    local def_sni custom_sni
+    def_sni=$(get_default_sni)
+    read -rp "Custom SNI / Bug Host (leave blank for ${def_sni}): " custom_sni
+    custom_sni=${custom_sni:-${def_sni}}
+
     days=${days:-30}
     max_ip=${max_ip:-2}
     exp_date=$(date -d "+${days} days" +"%Y-%m-%d")
@@ -93,8 +259,9 @@ create_ssh_user() {
 
     local host
     host=$(get_host)
-    echo -e "\n${GREEN}=== SSH / WebSocket Account Created ===${NC}"
-    echo -e "Host / IP          : ${host}"
+    echo -e "\n${GREEN}=== SSH / WebSocket / SSL Account Created ===${NC}"
+    echo -e "Server Host / IP   : ${host}"
+    echo -e "Custom SNI / Bug   : ${custom_sni}"
     echo -e "Username           : ${uname}"
     echo -e "Password           : ${upass}"
     echo -e "Expires On         : ${exp_date} (${days} days)"
@@ -102,9 +269,10 @@ create_ssh_user() {
     echo -e "OpenSSH Port       : 22"
     echo -e "Dropbear Port      : 109"
     echo -e "SSH WS (HTTP) Port : 80 (Supports any custom payload)"
-    echo -e "SSH SSL/WS Port    : 443 (Supports TLS 1.0, 1.1, 1.2, 1.3)"
+    echo -e "SSH SSL/WS Port    : 443 (Supports TLS 1.0, 1.1, 1.2, 1.3 + Any Custom SNI)"
     echo -e "BadVPN UDPGW Port  : 7300"
-    echo -e "Sample Payload     : GET / HTTP/1.1[crlf]Host: ${host}[crlf]Upgrade: websocket[crlf][crlf]"
+    echo -e "WS Payload (80/443): GET / HTTP/1.1[crlf]Host: ${custom_sni}[crlf]Upgrade: websocket[crlf][crlf]"
+    echo -e "SSL SNI Config     : Server=${host}:443 | SNI/Bug Host=${custom_sni}"
 }
 
 delete_ssh_user() {
@@ -149,7 +317,7 @@ update_ssh_ip_limit() {
 }
 
 # -----------------------------------------------------------------------------
-# Xray User Management (VLESS, VMess, Trojan - Port 443 & 80 WS & TCP)
+# Xray User Management (VLESS, VMess, Trojan - Port 443 & 80 WS & TCP + Custom SNI)
 # -----------------------------------------------------------------------------
 create_xray_user() {
     echo -e "\n${CYAN}--- Create Xray User (VLESS / VMess / Trojan on Port 443 & 80 WS + TCP) ---${NC}"
@@ -171,6 +339,11 @@ create_xray_user() {
     read -rp "Validity (days, e.g. 30): " days
     read -rp "Max Concurrent IPs (e.g. 2): " max_ip
 
+    local def_sni custom_sni
+    def_sni=$(get_default_sni)
+    read -rp "Custom SNI / Bug Host (leave blank for ${def_sni}): " custom_sni
+    custom_sni=${custom_sni:-${def_sni}}
+
     days=${days:-30}
     max_ip=${max_ip:-2}
     exp_date=$(date -d "+${days} days" +"%Y-%m-%d")
@@ -183,6 +356,10 @@ create_xray_user() {
         3) proto="trojan" ;;
         *) proto="all" ;;
     esac
+
+    if [[ ! -f "${XRAY_CONFIG}" ]]; then
+        repair_xray_service
+    fi
 
     if [[ -f "${XRAY_CONFIG}" ]]; then
         local tmp_json
@@ -206,7 +383,7 @@ create_xray_user() {
         fi
 
         mv "${tmp_json}" "${XRAY_CONFIG}"
-        systemctl restart xray 2>/dev/null || true
+        systemctl restart xray 2>/dev/null || repair_xray_service
     fi
 
     echo "${uname}|${proto}|${uuid}|${exp_date}|${max_ip}" >> "${XRAY_DB}"
@@ -214,33 +391,34 @@ create_xray_user() {
     local host
     host=$(get_host)
     echo -e "\n${GREEN}=== Xray Account Created ===${NC}"
-    echo -e "Username     : ${uname}"
-    echo -e "Protocol(s)  : ${proto^^}"
-    echo -e "UUID / Pass  : ${uuid}"
-    echo -e "Host / SNI   : ${host}"
-    echo -e "Expires On   : ${exp_date} (${days} days)"
-    echo -e "Max IP Limit : ${max_ip} IP(s)"
-    echo -e "Ports        : 443 (TLS) & 80 (Non-TLS) [WS & TCP]"
+    echo -e "Username        : ${uname}"
+    echo -e "Protocol(s)     : ${proto^^}"
+    echo -e "UUID / Password : ${uuid}"
+    echo -e "Server Host/IP  : ${host}"
+    echo -e "Custom SNI/Host : ${custom_sni}"
+    echo -e "Expires On      : ${exp_date} (${days} days)"
+    echo -e "Max IP Limit    : ${max_ip} IP(s)"
+    echo -e "Ports           : 443 (TLS) & 80 (Non-TLS) [WS & TCP]"
 
     if [[ "${proto}" == "vless" || "${proto}" == "all" ]]; then
-        echo -e "\n${YELLOW}[VLESS Links]${NC}"
-        echo "VLESS WS TLS (443)  : vless://${uuid}@${host}:443?encryption=none&security=tls&type=ws&host=${host}&path=%2Fvless&sni=${host}#${uname}-VLESS-WS-443"
-        echo "VLESS WS HTTP (80)  : vless://${uuid}@${host}:80?encryption=none&security=none&type=ws&host=${host}&path=%2Fvless#${uname}-VLESS-WS-80"
-        echo "VLESS TCP TLS (443) : vless://${uuid}@${host}:443?encryption=none&security=tls&type=tcp&sni=${host}#${uname}-VLESS-TCP-443"
-        echo "VLESS TCP HTTP (80) : vless://${uuid}@${host}:80?encryption=none&security=none&type=tcp#${uname}-VLESS-TCP-80"
+        echo -e "\n${YELLOW}[VLESS Links (Custom SNI: ${custom_sni})]${NC}"
+        echo "VLESS WS TLS (443)  : vless://${uuid}@${host}:443?encryption=none&security=tls&type=ws&host=${custom_sni}&path=%2Fvless&sni=${custom_sni}&allowInsecure=1#${uname}-VLESS-WS-443"
+        echo "VLESS WS HTTP (80)  : vless://${uuid}@${host}:80?encryption=none&security=none&type=ws&host=${custom_sni}&path=%2Fvless#${uname}-VLESS-WS-80"
+        echo "VLESS TCP TLS (443) : vless://${uuid}@${host}:443?encryption=none&security=tls&type=tcp&sni=${custom_sni}&allowInsecure=1#${uname}-VLESS-TCP-443"
+        echo "VLESS TCP HTTP (80) : vless://${uuid}@${host}:80?encryption=none&security=none&type=tcp&headerType=http&host=${custom_sni}#${uname}-VLESS-TCP-80"
     fi
 
     if [[ "${proto}" == "vmess" || "${proto}" == "all" ]]; then
         local vmess_ws_443 vmess_ws_80 vmess_tcp_443 vmess_tcp_80
-        vmess_ws_443=$(jq -n --arg ps "${uname}-VMESS-WS-443" --arg add "${host}" --arg id "${uuid}" \
-            '{v:"2",ps:$ps,add:$add,port:"443",id:$id,aid:"0",net:"ws",type:"none",host:$add,path:"/vmess",tls:"tls",sni:$add}' | base64 -w0)
-        vmess_ws_80=$(jq -n --arg ps "${uname}-VMESS-WS-80" --arg add "${host}" --arg id "${uuid}" \
-            '{v:"2",ps:$ps,add:$add,port:"80",id:$id,aid:"0",net:"ws",type:"none",host:$add,path:"/vmess",tls:"none"}' | base64 -w0)
-        vmess_tcp_443=$(jq -n --arg ps "${uname}-VMESS-TCP-443" --arg add "${host}" --arg id "${uuid}" \
-            '{v:"2",ps:$ps,add:$add,port:"443",id:$id,aid:"0",net:"tcp",type:"none",host:$add,tls:"tls",sni:$add}' | base64 -w0)
-        vmess_tcp_80=$(jq -n --arg ps "${uname}-VMESS-TCP-80" --arg add "${host}" --arg id "${uuid}" \
-            '{v:"2",ps:$ps,add:$add,port:"80",id:$id,aid:"0",net:"tcp",type:"none",host:$add,tls:"none"}' | base64 -w0)
-        echo -e "\n${YELLOW}[VMess Links]${NC}"
+        vmess_ws_443=$(jq -n --arg ps "${uname}-VMESS-WS-443" --arg add "${host}" --arg id "${uuid}" --arg sni "${custom_sni}" \
+            '{v:"2",ps:$ps,add:$add,port:"443",id:$id,aid:"0",net:"ws",type:"none",host:$sni,path:"/vmess",tls:"tls",sni:$sni,allowInsecure:true}' | base64 -w0)
+        vmess_ws_80=$(jq -n --arg ps "${uname}-VMESS-WS-80" --arg add "${host}" --arg id "${uuid}" --arg sni "${custom_sni}" \
+            '{v:"2",ps:$ps,add:$add,port:"80",id:$id,aid:"0",net:"ws",type:"none",host:$sni,path:"/vmess",tls:"none"}' | base64 -w0)
+        vmess_tcp_443=$(jq -n --arg ps "${uname}-VMESS-TCP-443" --arg add "${host}" --arg id "${uuid}" --arg sni "${custom_sni}" \
+            '{v:"2",ps:$ps,add:$add,port:"443",id:$id,aid:"0",net:"tcp",type:"none",host:$sni,tls:"tls",sni:$sni,allowInsecure:true}' | base64 -w0)
+        vmess_tcp_80=$(jq -n --arg ps "${uname}-VMESS-TCP-80" --arg add "${host}" --arg id "${uuid}" --arg sni "${custom_sni}" \
+            '{v:"2",ps:$ps,add:$add,port:"80",id:$id,aid:"0",net:"tcp",type:"none",host:$sni,tls:"none"}' | base64 -w0)
+        echo -e "\n${YELLOW}[VMess Links (Custom SNI: ${custom_sni})]${NC}"
         echo "VMess WS TLS (443)  : vmess://${vmess_ws_443}"
         echo "VMess WS HTTP (80)  : vmess://${vmess_ws_80}"
         echo "VMess TCP TLS (443) : vmess://${vmess_tcp_443}"
@@ -248,11 +426,11 @@ create_xray_user() {
     fi
 
     if [[ "${proto}" == "trojan" || "${proto}" == "all" ]]; then
-        echo -e "\n${YELLOW}[Trojan Links]${NC}"
-        echo "Trojan WS TLS (443)  : trojan://${uuid}@${host}:443?security=tls&type=ws&host=${host}&path=%2Ftrojan&sni=${host}#${uname}-TROJAN-WS-443"
-        echo "Trojan WS HTTP (80)  : trojan://${uuid}@${host}:80?security=none&type=ws&host=${host}&path=%2Ftrojan#${uname}-TROJAN-WS-80"
-        echo "Trojan TCP TLS (443) : trojan://${uuid}@${host}:443?security=tls&type=tcp&sni=${host}#${uname}-TROJAN-TCP-443"
-        echo "Trojan TCP HTTP (80) : trojan://${uuid}@${host}:80?security=none&type=tcp#${uname}-TROJAN-TCP-80"
+        echo -e "\n${YELLOW}[Trojan Links (Custom SNI: ${custom_sni})]${NC}"
+        echo "Trojan WS TLS (443)  : trojan://${uuid}@${host}:443?security=tls&type=ws&host=${custom_sni}&path=%2Ftrojan&sni=${custom_sni}&allowInsecure=1#${uname}-TROJAN-WS-443"
+        echo "Trojan WS HTTP (80)  : trojan://${uuid}@${host}:80?security=none&type=ws&host=${custom_sni}&path=%2Ftrojan#${uname}-TROJAN-WS-80"
+        echo "Trojan TCP TLS (443) : trojan://${uuid}@${host}:443?security=tls&type=tcp&sni=${custom_sni}&allowInsecure=1#${uname}-TROJAN-TCP-443"
+        echo "Trojan TCP HTTP (80) : trojan://${uuid}@${host}:80?security=none&type=tcp&sni=${custom_sni}#${uname}-TROJAN-TCP-80"
     fi
 }
 
@@ -311,13 +489,13 @@ service_and_port_menu() {
         echo -e "\n${CYAN}============================================================${NC}"
         echo -e "${CYAN}         Service Status & Port Deactivation Manager         ${NC}"
         echo -e "${CYAN}============================================================${NC}"
-        echo -e "  OpenSSH (Port 22)          : $(svc_badge ssh)"
-        echo -e "  Dropbear SSH (Port 109)    : $(svc_badge dropbear)"
-        echo -e "  SSH-WS & Multiplexer (80/443): $(svc_badge ssh-ws)"
+        echo -e "  OpenSSH (Port 22)             : $(svc_badge ssh)"
+        echo -e "  Dropbear SSH (Port 109)       : $(svc_badge dropbear)"
+        echo -e "  SSH-WS & Multiplexer (80/443) : $(svc_badge ssh-ws)"
         echo -e "  Xray-core (VLESS/VMess/Trojan): $(svc_badge xray)"
-        echo -e "  BadVPN UDPGW (Port 7300)   : $(svc_badge badvpn-udpgw)"
-        echo -e "  Nginx (ACME / Web)         : $(svc_badge nginx)"
-        echo -e "  IP & Conn Limiter Daemon   : $(svc_badge vps-limiter)"
+        echo -e "  BadVPN UDPGW (Port 7300)      : $(svc_badge badvpn-udpgw)"
+        echo -e "  Nginx (ACME / Web)            : $(svc_badge nginx)"
+        echo -e "  IP & Conn Limiter Daemon      : $(svc_badge vps-limiter)"
         echo -e "------------------------------------------------------------"
         echo -e "  Port 80 Mode  : $(get_port_mode_label PORT_80_MODE)"
         echo -e "  Port 443 Mode : $(get_port_mode_label PORT_443_MODE)"
@@ -330,6 +508,7 @@ service_and_port_menu() {
         echo "  6) Set Port 443 to XRAY EXCLUSIVE (Disable SSH-SSL/WS on Port 443)"
         echo "  7) Stop / Disable an Individual Service (xray, ssh-ws, dropbear, badvpn-udpgw)"
         echo "  8) Start / Enable an Individual Service"
+        echo "  9) Repair & Restart Xray Service Now"
         echo "  0) Back to Main Menu"
         read -rp "Select option: " sopt
 
@@ -352,8 +531,17 @@ service_and_port_menu() {
                 ;;
             8)
                 read -rp "Enter service name to start/enable (xray / ssh-ws / dropbear / badvpn-udpgw / vps-limiter): " tsvc
-                systemctl enable "${tsvc}" 2>/dev/null && systemctl restart "${tsvc}" 2>/dev/null
+                if [[ "${tsvc}" == "xray" ]]; then
+                    repair_xray_service
+                else
+                    systemctl enable "${tsvc}" 2>/dev/null && systemctl restart "${tsvc}" 2>/dev/null
+                fi
                 echo -e "${GREEN}Service '${tsvc}' enabled and started.${NC}"
+                continue
+                ;;
+            9)
+                repair_xray_service
+                echo -e "${GREEN}Xray configuration verified and service restarted!${NC}"
                 continue
                 ;;
             0) break ;;
@@ -370,12 +558,16 @@ EOF
 }
 
 # -----------------------------------------------------------------------------
-# SSL Certificate Manager (Domain Let's Encrypt OR IP Self-Signed)
+# SSL Certificate & Custom SNI Manager (Domain Let's Encrypt / IP / Custom SNI)
 # -----------------------------------------------------------------------------
 ssl_menu() {
-    echo -e "\n${CYAN}--- SSL Certificate Setup (Domain Let's Encrypt or IP Self-Signed) ---${NC}"
+    echo -e "\n${CYAN}--- SSL Certificate & Custom SNI Manager ---${NC}"
+    echo -e "  Current Host/Domain : $(get_host)"
+    echo -e "  Default Custom SNI  : $(get_default_sni)"
+    echo "------------------------------------------------------------"
     echo "  1) Issue Free Let's Encrypt Certificate for a Domain (via acme.sh)"
-    echo "  2) Generate Self-Signed Certificate for VPS IP (No Domain Needed)"
+    echo "  2) Generate Self-Signed Certificate for VPS IP or Custom SNI (No Domain Needed)"
+    echo "  3) Set Default Custom SNI / Bug Host (used for SSL & Xray configs)"
     echo "  0) Back"
     read -rp "Select option: " copt
     mkdir -p "${CONFIG_DIR}/ssl"
@@ -398,21 +590,36 @@ ssl_menu() {
             echo -e "${GREEN}Let's Encrypt SSL certificate installed for ${dom}!${NC}"
             ;;
         2)
-            local vip
-            vip=$(curl -fsSL4 icanhazip.com 2>/dev/null || hostname -I | awk '{print $1}')
+            local vip cert_cn
+            vip=$(curl -fsSL4 --max-time 2 icanhazip.com 2>/dev/null || hostname -I | awk '{print $1}')
+            read -rp "Enter Custom SNI / Bug Host for Certificate CN (leave blank for IP ${vip}): " cert_cn
+            cert_cn=${cert_cn:-${vip}}
+            if [[ "${cert_cn}" != "${vip}" ]]; then
+                echo "${cert_cn}" > "${SNI_FILE}"
+            fi
             rm -f "${DOMAIN_FILE}"
             openssl req -x509 -nodes -newkey rsa:2048 -days 3650 \
                 -keyout "${KEY_FILE}" \
                 -out "${CERT_FILE}" \
-                -subj "/C=US/ST=Cloud/L=VPS/O=VPS-Panel/CN=${vip}" \
-                -addext "subjectAltName=IP:${vip}" 2>/dev/null || \
+                -subj "/C=US/ST=Cloud/L=VPS/O=VPS-Panel/CN=${cert_cn}" \
+                -addext "subjectAltName=DNS:${cert_cn},IP:${vip}" 2>/dev/null || \
             openssl req -x509 -nodes -newkey rsa:2048 -days 3650 \
                 -keyout "${KEY_FILE}" \
                 -out "${CERT_FILE}" \
-                -subj "/C=US/ST=Cloud/L=VPS/O=VPS-Panel/CN=${vip}"
+                -subj "/C=US/ST=Cloud/L=VPS/O=VPS-Panel/CN=${cert_cn}"
             chmod 600 "${KEY_FILE}"
             systemctl restart ssh-ws xray 2>/dev/null || true
-            echo -e "${GREEN}Self-signed IP certificate generated for ${vip} (TLS 1.0-1.3 supported)!${NC}"
+            echo -e "${GREEN}Self-signed certificate generated (CN=${cert_cn}, IP=${vip}, all Custom SNIs accepted)!${NC}"
+            ;;
+        3)
+            read -rp "Enter Default Custom SNI / Bug Host (or 'clear' to reset): " nsni
+            if [[ "${nsni}" == "clear" || -z "${nsni}" ]]; then
+                rm -f "${SNI_FILE}"
+                echo -e "${YELLOW}Default Custom SNI cleared (using VPS Host/IP).${NC}"
+            else
+                echo "${nsni}" > "${SNI_FILE}"
+                echo -e "${GREEN}Default Custom SNI set to: ${nsni}${NC}"
+            fi
             ;;
     esac
 }
@@ -422,15 +629,16 @@ ssl_menu() {
 # -----------------------------------------------------------------------------
 main_menu() {
     while true; do
-        local host os_name
+        local host sni os_name
         host=$(get_host)
+        sni=$(get_default_sni)
         os_name=$(grep -E '^PRETTY_NAME=' /etc/os-release 2>/dev/null | cut -d'"' -f2 || uname -s)
 
         echo -e "\n${BLUE}============================================================${NC}"
         echo -e "${CYAN}         DEBIAN / UBUNTU VPS MANAGEMENT PANEL (CLI)         ${NC}"
         echo -e "${BLUE}============================================================${NC}"
         echo -e "  OS           : ${os_name}"
-        echo -e "  Host / IP    : ${host}"
+        echo -e "  Host / IP    : ${host}   | Default SNI: ${sni}"
         echo -e "  SSH-WS (80)  : $(svc_badge ssh-ws)   | Xray-core : $(svc_badge xray)"
         echo -e "  Dropbear     : $(svc_badge dropbear)   | BadVPN 7300: $(svc_badge badvpn-udpgw)"
         echo -e "  IP Limiter   : $(svc_badge vps-limiter)   | OpenSSH   : $(svc_badge ssh)"
@@ -438,19 +646,19 @@ main_menu() {
         echo -e "  Port 443 Mode: $(get_port_mode_label PORT_443_MODE)"
         echo -e "${BLUE}------------------------------------------------------------${NC}"
         echo "  [SSH / SSH-WS / SSL-WS Management]"
-        echo "    1) Create SSH / WS / SSL User (Custom Payload 80 & SSL 443)"
+        echo "    1) Create SSH / WS / SSL User (Custom Payload 80 & Custom SNI 443)"
         echo "    2) Delete SSH User"
         echo "    3) Update SSH User IP Limit / Validity"
         echo ""
-        echo "  [Xray Management (VLESS, VMess, Trojan - 443 & 80 WS/TCP)]"
+        echo "  [Xray Management (VLESS, VMess, Trojan - 443 & 80 WS/TCP + Custom SNI)]"
         echo "    4) Create Xray User (VLESS / VMess / Trojan)"
         echo "    5) Delete Xray User"
         echo "    6) Update Xray User IP Limit / Validity"
         echo ""
-        echo "  [Monitoring, Port Modes & SSL]"
+        echo "  [Monitoring, Port Modes & Custom SNI / SSL]"
         echo "    7) Show Active Connections & Per-User IP Usage"
         echo "    8) Service Status & Port 80/443 Conflict Manager"
-        echo "    9) SSL Certificate Manager (Domain Let's Encrypt / IP Self-Signed)"
+        echo "    9) SSL Certificate & Custom SNI Manager"
         echo "   10) Run Expired Account Cleanup Now"
         echo "    0) Exit"
         echo -e "${BLUE}------------------------------------------------------------${NC}"
