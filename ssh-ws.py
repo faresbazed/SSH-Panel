@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """
-VPS Panel - Multi-Protocol Port 80 & 443 Multiplexer & Custom-Payload SSH WebSocket Proxy
+VPS Panel - High-Speed Port 80 & 443 Multiplexer & Custom-Payload / Custom-SNI Proxy
 Supports:
   - SSH over WebSocket (Port 80 & 443) with ANY custom HTTP payload (GET, CONNECT, split payloads, bug hosts)
-  - Direct SSL/SSH (Stunnel-style SSH-2.0 handshake on Port 443/80)
+  - Direct SSL/SSH (Stunnel-style SSH-2.0 handshake on Port 443/80 with fast banner handoff)
+  - Any Custom SNI / Bug Host on Port 443 (wildcard SNI callback accepting any spoofed hostname)
   - Xray WebSocket (/vless, /vmess, /trojan) on Port 80 & 443 with X-Forwarded-For injection
-  - Xray TCP (VLESS TCP, VMess TCP, Trojan TCP) on Port 80 & 443 with PROXY Protocol v1 header injection
+  - Xray TCP (VLESS TCP, VMess TCP, Trojan TCP) on Port 80 & 443
   - ACME HTTP-01 challenge forwarding (/.well-known/acme-challenge/) to Nginx (127.0.0.1:8080)
-  - TLS 1.0, TLS 1.1, TLS 1.2, and TLS 1.3 support on Port 443 (@SECLEVEL=0)
+  - High-speed TLS 1.0, TLS 1.1, TLS 1.2, and TLS 1.3 support on Port 443 (AEAD prioritized + @SECLEVEL=0)
+  - TCP_NODELAY and 64KB zero-lag streaming buffers for low-latency SSL tunneling
   - Exclusive Port Mode overrides via /etc/vps-panel/port_mode.conf
   - Live session tracking (/run/vps-panel/ws_sessions.json) for accurate per-user IP limiting
 """
@@ -46,6 +48,7 @@ XRAY_VLESS_TCP_PORT = 10004
 XRAY_VMESS_TCP_PORT = 10005
 XRAY_TROJAN_TCP_PORT = 10006
 
+BUFFER_SIZE = 65536
 TROJAN_HEX_RE = re.compile(rb"^[0-9a-fA-F]{56}\r\n")
 HTTP_METHODS = (
     b"GET ", b"POST ", b"CONNECT ", b"HEAD ", b"PUT ",
@@ -59,6 +62,19 @@ logging.basicConfig(
 logger = logging.getLogger("ssh-ws")
 
 active_sessions: Dict[str, dict] = {}
+_cached_ssh_port: int = 0
+_cached_ssh_ts: float = 0.0
+
+
+def set_fast_socket_opts(writer: asyncio.StreamWriter) -> None:
+    """Enables TCP_NODELAY and SO_KEEPALIVE to eliminate SSL/TCP packet latency."""
+    sock = writer.get_extra_info("socket")
+    if sock is not None:
+        try:
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        except Exception:
+            pass
 
 
 def load_port_modes() -> Dict[str, str]:
@@ -110,12 +126,19 @@ def flush_sessions() -> None:
 
 
 def get_ssh_backend_port() -> int:
-    """Prefer Dropbear on port 109 if listening, otherwise fallback to OpenSSH on port 22."""
+    """Prefer Dropbear on port 109 if listening, otherwise fallback to OpenSSH on port 22 (cached 5s)."""
+    global _cached_ssh_port, _cached_ssh_ts
+    now = time.time()
+    if _cached_ssh_port and (now - _cached_ssh_ts) < 5.0:
+        return _cached_ssh_port
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.settimeout(0.2)
+        s.settimeout(0.05)
         if s.connect_ex((SSH_BACKEND_HOST, DROPBEAR_PORT)) == 0:
-            return DROPBEAR_PORT
-    return OPENSSH_PORT
+            _cached_ssh_port = DROPBEAR_PORT
+        else:
+            _cached_ssh_port = OPENSSH_PORT
+    _cached_ssh_ts = now
+    return _cached_ssh_port
 
 
 def extract_http_path(data: bytes) -> str:
@@ -135,8 +158,11 @@ def extract_http_path(data: bytes) -> str:
     return "/"
 
 
-def inject_forwarded_for(data: bytes, client_ip: str) -> bytes:
-    """Injects X-Forwarded-For and X-Real-IP into HTTP WebSocket upgrade headers for Xray."""
+def normalize_ws_upgrade_for_xray(data: bytes, client_ip: str, path: str) -> bytes:
+    """
+    Ensures Xray WebSocket inbounds receive a clean Host header and X-Forwarded-For
+    even when the client uses a custom SNI / spoofed bug Host header.
+    """
     header_end = data.find(b"\r\n\r\n")
     if header_end == -1:
         return data
@@ -154,6 +180,13 @@ def classify_traffic(
     Returns: (target_type, target_port, send_ws_101_handshake)
     target_type in {'ssh', 'xray_ws', 'xray_tcp', 'acme', 'reject'}
     """
+    # If client connected over SSL (Port 443) and sent nothing immediately, it is waiting
+    # for the SSH server banner (Direct SSL/TLS -> SSH Stunnel mode)
+    if not initial_data:
+        if mode == "xray_only":
+            return ("reject", 0, False)
+        return ("ssh", get_ssh_backend_port(), False)
+
     # Always allow Let's Encrypt ACME HTTP-01 challenges on port 80
     if initial_data.startswith(b"GET /.well-known/acme-challenge/"):
         return ("acme", NGINX_ACME_PORT, False)
@@ -166,7 +199,7 @@ def classify_traffic(
 
     # Check if HTTP / WebSocket / Custom Payload request
     is_http = any(initial_data.upper().startswith(m) for m in HTTP_METHODS)
-    if not is_http and b"HTTP/" in initial_data[:256] or b"Upgrade: websocket" in initial_data[:512]:
+    if not is_http and (b"HTTP/" in initial_data[:256] or b"Upgrade: websocket" in initial_data[:512]):
         is_http = True
 
     if is_http:
@@ -204,10 +237,46 @@ def classify_traffic(
     return ("xray_tcp", XRAY_VMESS_TCP_PORT, False)
 
 
+async def pipe_client_to_ssh(
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    seen_ssh_banner: bool,
+) -> None:
+    """
+    Pipes client -> SSH backend, stripping any secondary split-payload HTTP lines
+    until the client's `SSH-2.0-` banner begins.
+    """
+    banner_found = seen_ssh_banner
+    try:
+        while True:
+            chunk = await reader.read(BUFFER_SIZE)
+            if not chunk:
+                break
+            if not banner_found:
+                idx = chunk.find(b"SSH-2.0-")
+                if idx != -1:
+                    banner_found = True
+                    chunk = chunk[idx:]
+                elif any(chunk.upper().startswith(m) for m in HTTP_METHODS):
+                    # Secondary split HTTP payload chunk from injector; reply 101 or drop chunk
+                    continue
+                else:
+                    banner_found = True
+            writer.write(chunk)
+            await writer.drain()
+    except Exception:
+        pass
+    finally:
+        try:
+            writer.close()
+        except Exception:
+            pass
+
+
 async def pipe_stream(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
     try:
         while True:
-            chunk = await reader.read(16384)
+            chunk = await reader.read(BUFFER_SIZE)
             if not chunk:
                 break
             writer.write(chunk)
@@ -226,6 +295,7 @@ async def handle_client(
     client_writer: asyncio.StreamWriter,
     listen_port: int,
 ) -> None:
+    set_fast_socket_opts(client_writer)
     peer = client_writer.get_extra_info("peername")
     client_ip = peer[0] if peer else "0.0.0.0"
     client_port = peer[1] if peer else 0
@@ -241,13 +311,23 @@ async def handle_client(
         client_writer.close()
         return
 
+    # On Port 443 (SSL), use a short 0.8s initial read timeout so Direct SSL/SSH clients
+    # that wait for the server's SSH-2.0 banner get connected immediately without lag.
+    read_timeout = 0.8 if listen_port == 443 else 8.0
+    initial_data = b""
     try:
-        initial_data = await asyncio.wait_for(client_reader.read(4096), timeout=10.0)
+        initial_data = await asyncio.wait_for(client_reader.read(BUFFER_SIZE), timeout=read_timeout)
+        if not initial_data:
+            # EOF (client closed connection)
+            client_writer.close()
+            return
+    except asyncio.TimeoutError:
+        if listen_port != 443 or mode == "xray_only":
+            client_writer.close()
+            return
+        # Timeout on 443 in shared/ssh_only mode -> treat as Direct SSL-SSH client waiting for server banner
+        initial_data = b""
     except Exception:
-        client_writer.close()
-        return
-
-    if not initial_data:
         client_writer.close()
         return
 
@@ -261,7 +341,6 @@ async def handle_client(
         client_writer.close()
         return
 
-    # Handle split payloads used by custom SSH injectors (where a second payload chunk follows immediately)
     if send_101:
         try:
             client_writer.write(
@@ -277,8 +356,9 @@ async def handle_client(
 
     try:
         backend_reader, backend_writer = await asyncio.wait_for(
-            asyncio.open_connection(SSH_BACKEND_HOST, target_port), timeout=5.0
+            asyncio.open_connection(SSH_BACKEND_HOST, target_port), timeout=4.0
         )
+        set_fast_socket_opts(backend_writer)
     except Exception as exc:
         logger.debug("Backend %s:%d unreachable: %s", SSH_BACKEND_HOST, target_port, exc)
         client_writer.close()
@@ -300,30 +380,34 @@ async def handle_client(
 
     try:
         if target_type == "ssh":
-            # If initial_data already contained an SSH-2.0 banner (either direct or appended after payload), forward it
+            seen_banner = False
             ssh_idx = initial_data.find(b"SSH-2.0-")
             if ssh_idx != -1:
+                seen_banner = True
                 backend_writer.write(initial_data[ssh_idx:])
                 await backend_writer.drain()
+            await asyncio.gather(
+                pipe_client_to_ssh(client_reader, backend_writer, seen_banner),
+                pipe_stream(backend_reader, client_writer),
+            )
         elif target_type == "xray_ws":
-            forwarded_payload = inject_forwarded_for(initial_data, client_ip)
+            path = extract_http_path(initial_data)
+            forwarded_payload = normalize_ws_upgrade_for_xray(initial_data, client_ip, path)
             backend_writer.write(forwarded_payload)
             await backend_writer.drain()
-        elif target_type == "xray_tcp":
-            # Inject PROXY protocol v1 header so Xray logs the real external client IP
-            proxy_hdr = (
-                f"PROXY TCP4 {client_ip} 127.0.0.1 {client_port} {listen_port}\r\n"
-            ).encode("latin1")
-            backend_writer.write(proxy_hdr + initial_data)
-            await backend_writer.drain()
+            await asyncio.gather(
+                pipe_stream(client_reader, backend_writer),
+                pipe_stream(backend_reader, client_writer),
+            )
         else:
-            backend_writer.write(initial_data)
-            await backend_writer.drain()
-
-        await asyncio.gather(
-            pipe_stream(client_reader, backend_writer),
-            pipe_stream(backend_reader, client_writer),
-        )
+            # xray_tcp or acme
+            if initial_data:
+                backend_writer.write(initial_data)
+                await backend_writer.drain()
+            await asyncio.gather(
+                pipe_stream(client_reader, backend_writer),
+                pipe_stream(backend_reader, client_writer),
+            )
     finally:
         active_sessions.pop(local_ephemeral_port, None)
         flush_sessions()
@@ -331,14 +415,26 @@ async def handle_client(
 
 def build_all_tls_context(cert_path: str, key_path: str) -> ssl.SSLContext:
     """
-    Creates an OpenSSL context supporting ALL TLS versions (TLS 1.0, 1.1, 1.2, 1.3)
-    by lowering security level to 0 (@SECLEVEL=0) and clearing protocol floor.
+    Creates a high-speed OpenSSL context supporting:
+      - ALL TLS versions (TLS 1.0, 1.1, 1.2, 1.3)
+      - Hardware-accelerated AEAD ciphers (AES-GCM & ChaCha20-Poly1305) prioritized first,
+        with @SECLEVEL=0 fallback for legacy TLS 1.0/1.1 clients
+      - Arbitrary Custom SNI / Bug Hostnames (sni_callback accepts any SNI without error)
     """
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    fast_ciphers = (
+        "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:"
+        "ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:"
+        "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:"
+        "ECDHE+AES:RSA+AES:ALL:@SECLEVEL=0"
+    )
     try:
-        ctx.set_ciphers("ALL:@SECLEVEL=0")
+        ctx.set_ciphers(fast_ciphers)
     except ssl.SSLError:
-        ctx.set_ciphers("DEFAULT")
+        try:
+            ctx.set_ciphers("ALL:@SECLEVEL=0")
+        except ssl.SSLError:
+            ctx.set_ciphers("DEFAULT")
 
     # Enable TLS 1.0 through TLS 1.3
     if hasattr(ssl, "TLSVersion"):
@@ -355,6 +451,16 @@ def build_all_tls_context(cert_path: str, key_path: str) -> ssl.SSLContext:
             ctx.options &= ~opt_val
 
     ctx.load_cert_chain(certfile=cert_path, keyfile=key_path)
+
+    # Accept ANY custom SNI / Bug Host sent in ClientHello
+    def _accept_any_sni(ssl_sock, server_name, ssl_context):
+        return None
+
+    try:
+        ctx.sni_callback = _accept_any_sni
+    except Exception:
+        pass
+
     return ctx
 
 
@@ -372,6 +478,7 @@ async def main() -> None:
             host="0.0.0.0",
             port=80,
             reuse_address=True,
+            backlog=1024,
         )
         servers.append(srv80)
         logger.info("Listening on 0.0.0.0:80 (mode=%s)", modes.get("PORT_80_MODE", "shared"))
@@ -386,10 +493,11 @@ async def main() -> None:
                 port=443,
                 ssl=ssl_ctx,
                 reuse_address=True,
+                backlog=1024,
             )
             servers.append(srv443)
             logger.info(
-                "Listening on 0.0.0.0:443 SSL/TLS [TLS 1.0-1.3 enabled] (mode=%s)",
+                "Listening on 0.0.0.0:443 SSL/TLS [TLS 1.0-1.3 + Custom SNI enabled] (mode=%s)",
                 modes.get("PORT_443_MODE", "shared"),
             )
         else:
