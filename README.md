@@ -30,27 +30,14 @@ chmod +x install.sh
 sudo ./install.sh
 ```
 
-Once published to your GitHub repository (replace `<YOUR_GITHUB_USER>` and `<YOUR_REPO>`), you can install it on any VPS with a single command:
+
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/<YOUR_GITHUB_USER>/<YOUR_REPO>/main/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/faresbazed/SSH-Panel/main/install.sh)
 ```
 
 After installation finishes, open the management panel at any time by running:
 
 ```bash
 menu
-```
-
-## Publishing to GitHub
-
-Run these commands inside a folder containing `install.sh`, `menu.sh`, `ssh-ws.py`, `limiter.py`, and `README.md`:
-
-```bash
-git init
-git branch -M main
-git add install.sh menu.sh ssh-ws.py limiter.py README.md
-git commit -m "Initial release: Debian/Ubuntu SSH-WS & Xray VPS Management Panel"
-git remote add origin https://github.com/<YOUR_GITHUB_USER>/<YOUR_REPO>.git
-git push -u origin main
 ```
