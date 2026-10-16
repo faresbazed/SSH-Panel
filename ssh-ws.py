@@ -3,6 +3,7 @@ import asyncio
 import base64
 import hashlib
 import os
+import re
 import socket
 import ssl
 
@@ -25,7 +26,18 @@ XRAY_PORTS = {
 }
 
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
-HTTP_METHODS = (b"GET ", b"POST ", b"CONNECT ", b"HEAD ", b"PUT ", b"OPTIONS ", b"PATCH ")
+HTTP_METHODS = (
+    b"GET ",
+    b"POST ",
+    b"CONNECT ",
+    b"HEAD ",
+    b"PUT ",
+    b"OPTIONS ",
+    b"PATCH ",
+    b"ACL ",
+    b"MOVE ",
+    b"PROPFIND ",
+)
 
 
 def set_nodelay(sock):
@@ -36,11 +48,15 @@ def set_nodelay(sock):
 
 
 def build_ws_upgrade_response(header_bytes):
-    """Returns 101 Switching Protocols with RFC6455 Sec-WebSocket-Accept if requested (needed by cloudflared)."""
+    """
+    If Sec-WebSocket-Key is present (e.g. cloudflared or strict WS client),
+    include Sec-WebSocket-Accept. Otherwise return standard 101 Switching Protocols
+    expected by HTTP Custom / HTTP Injector on Port 80 & 443.
+    """
     ws_key = None
     try:
-        lines = header_bytes.decode("latin-1", errors="ignore").split("\r\n")
-        for line in lines:
+        text = header_bytes.decode("latin-1", errors="ignore")
+        for line in text.split("\r\n"):
             if line.lower().startswith("sec-websocket-key:"):
                 ws_key = line.split(":", 1)[1].strip()
                 break
@@ -63,6 +79,83 @@ def build_ws_upgrade_response(header_bytes):
         b"Upgrade: websocket\r\n"
         b"Connection: Upgrade\r\n\r\n"
     )
+
+
+def detect_xray_ws_route(header_bytes):
+    """
+    Inspects HTTP request line to see if it targets /vless, /vmess, or /trojan.
+    Normalizes full URLs or /vless-ws paths to the exact path Xray expects.
+    """
+    try:
+        first_line = header_bytes.split(b"\r\n", 1)[0].decode("latin-1", errors="ignore")
+        parts = first_line.split(" ")
+        if len(parts) < 2:
+            return None, header_bytes
+        raw_target = parts[1]
+        # Strip scheme://host if client sent full URI in GET line
+        path = re.sub(r"^[a-zA-Z]+://[^/]+", "", raw_target)
+        clean_path = path.split("?", 1)[0].lower()
+
+        if clean_path.startswith("/vless"):
+            rebuilt = header_bytes.replace(raw_target.encode("latin-1"), b"/vless", 1)
+            return XRAY_PORTS["vless_ws"], rebuilt
+        if clean_path.startswith("/vmess"):
+            rebuilt = header_bytes.replace(raw_target.encode("latin-1"), b"/vmess", 1)
+            return XRAY_PORTS["vmess_ws"], rebuilt
+        if clean_path.startswith("/trojan"):
+            rebuilt = header_bytes.replace(raw_target.encode("latin-1"), b"/trojan", 1)
+            return XRAY_PORTS["trojan_ws"], rebuilt
+    except Exception:
+        pass
+    return None, header_bytes
+
+
+async def pipe_client_to_ssh(reader, ssh_writer, initial_remainder=b""):
+    """
+    Forwards client traffic to Dropbear/OpenSSH.
+    Automatically strips split HTTP payload chunks before 'SSH-2.0-' begins
+    so split payloads on Port 80 never corrupt the SSH handshake.
+    """
+    ssh_started = False
+    try:
+        if initial_remainder:
+            idx = initial_remainder.find(b"SSH-2.0-")
+            if idx != -1:
+                ssh_started = True
+                ssh_writer.write(initial_remainder[idx:])
+                await ssh_writer.drain()
+            elif not initial_remainder.startswith(HTTP_METHODS):
+                ssh_started = True
+                ssh_writer.write(initial_remainder)
+                await ssh_writer.drain()
+
+        while True:
+            chunk = await reader.read(32768)
+            if not chunk:
+                break
+            if not ssh_started:
+                idx = chunk.find(b"SSH-2.0-")
+                if idx != -1:
+                    ssh_started = True
+                    ssh_writer.write(chunk[idx:])
+                    await ssh_writer.drain()
+                elif chunk.startswith(HTTP_METHODS) or b"HTTP/1." in chunk:
+                    # Ignore secondary split payload headers from injector
+                    continue
+                else:
+                    ssh_started = True
+                    ssh_writer.write(chunk)
+                    await ssh_writer.drain()
+            else:
+                ssh_writer.write(chunk)
+                await ssh_writer.drain()
+    except Exception:
+        pass
+    finally:
+        try:
+            ssh_writer.close()
+        except Exception:
+            pass
 
 
 async def pipe_stream(reader, writer):
@@ -106,68 +199,81 @@ async def handle_multiplexed_client(reader, writer):
         writer.close()
         return
 
-    target_reader = None
-    target_writer = None
-
     try:
         # 1. Direct SSH-2.0 Handshake
         if first_data.startswith(b"SSH-2.0-"):
             target_reader, target_writer = await connect_ssh_backend()
+            tsock = target_writer.get_extra_info("socket")
+            if tsock:
+                set_nodelay(tsock)
             target_writer.write(first_data)
             await target_writer.drain()
+            await asyncio.gather(
+                pipe_stream(reader, target_writer),
+                pipe_stream(target_reader, writer),
+            )
+            return
 
-        # 2. HTTP / WebSocket Requests (Xray WS or SSH-WS Payload / Cloudflared)
-        elif first_data.startswith(HTTP_METHODS):
-            first_line = first_data.split(b"\r\n", 1)[0].decode("latin-1", errors="ignore")
-            parts = first_line.split(" ")
-            path = parts[1] if len(parts) > 1 else "/"
+        # 2. HTTP / WebSocket Requests (Xray WS or SSH-WS Payload on Port 80/443/Cloudflared)
+        if first_data.startswith(HTTP_METHODS) or b"HTTP/1." in first_data[:256] or b"Upgrade:" in first_data[:512]:
+            # Wait briefly if headers haven't finished with \r\n\r\n yet
+            while b"\r\n\r\n" not in first_data and len(first_data) < 16384:
+                try:
+                    more = await asyncio.wait_for(reader.read(4096), timeout=2.0)
+                    if not more:
+                        break
+                    first_data += more
+                except Exception:
+                    break
 
-            if path.startswith("/vless"):
-                normalized = first_data.replace(b"GET /vless-ws ", b"GET /vless ", 1)
-                target_reader, target_writer = await asyncio.open_connection("127.0.0.1", XRAY_PORTS["vless_ws"])
-                target_writer.write(normalized)
+            xray_port, normalized_data = detect_xray_ws_route(first_data)
+
+            if xray_port is not None:
+                target_reader, target_writer = await asyncio.open_connection("127.0.0.1", xray_port)
+                tsock = target_writer.get_extra_info("socket")
+                if tsock:
+                    set_nodelay(tsock)
+                target_writer.write(normalized_data)
                 await target_writer.drain()
-
-            elif path.startswith("/vmess"):
-                normalized = first_data.replace(b"GET /vmess-ws ", b"GET /vmess ", 1)
-                target_reader, target_writer = await asyncio.open_connection("127.0.0.1", XRAY_PORTS["vmess_ws"])
-                target_writer.write(normalized)
-                await target_writer.drain()
-
-            elif path.startswith("/trojan"):
-                normalized = first_data.replace(b"GET /trojan-ws ", b"GET /trojan ", 1)
-                target_reader, target_writer = await asyncio.open_connection("127.0.0.1", XRAY_PORTS["trojan_ws"])
-                target_writer.write(normalized)
-                await target_writer.drain()
-
+                await asyncio.gather(
+                    pipe_stream(reader, target_writer),
+                    pipe_stream(target_reader, writer),
+                )
+                return
             else:
-                # SSH-WS Custom Payload or Cloudflared SSH-WS Upgrade
+                # SSH-WS Custom Payload (Port 80, Port 443 SSL, or Cloudflared)
                 target_reader, target_writer = await connect_ssh_backend()
+                tsock = target_writer.get_extra_info("socket")
+                if tsock:
+                    set_nodelay(tsock)
+
                 writer.write(build_ws_upgrade_response(first_data))
                 await writer.drain()
 
+                remainder = b""
                 if b"\r\n\r\n" in first_data:
-                    remainder = first_data.split(b"\r\n\r\n", 1)[1]
-                    if remainder:
-                        target_writer.write(remainder)
-                        await target_writer.drain()
+                    remainder = first_data.split(b"\r\n\r\n", 1)[-1]
+
+                await asyncio.gather(
+                    pipe_client_to_ssh(reader, target_writer, remainder),
+                    pipe_stream(target_reader, writer),
+                )
+                return
 
         # 3. Binary Xray TCP Streams (Trojan TCP / VLESS TCP / VMess TCP)
+        if len(first_data) >= 58 and first_data[56:58] == b"\r\n":
+            xray_port = XRAY_PORTS["trojan_tcp"]
+        elif first_data[0] == 0:
+            xray_port = XRAY_PORTS["vless_tcp"]
         else:
-            if len(first_data) >= 58 and first_data[56:58] == b"\r\n":
-                xray_port = XRAY_PORTS["trojan_tcp"]
-            elif first_data[0] == 0:
-                xray_port = XRAY_PORTS["vless_tcp"]
-            else:
-                xray_port = XRAY_PORTS["vmess_tcp"]
+            xray_port = XRAY_PORTS["vmess_tcp"]
 
-            target_reader, target_writer = await asyncio.open_connection("127.0.0.1", xray_port)
-            target_writer.write(first_data)
-            await target_writer.drain()
-
+        target_reader, target_writer = await asyncio.open_connection("127.0.0.1", xray_port)
         tsock = target_writer.get_extra_info("socket")
         if tsock:
             set_nodelay(tsock)
+        target_writer.write(first_data)
+        await target_writer.drain()
 
         await asyncio.gather(
             pipe_stream(reader, target_writer),
@@ -184,9 +290,12 @@ def create_ssl_context():
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
+    try:
+        ctx.minimum_version = ssl.TLSVersion.TLSv1
+    except Exception:
+        pass
     ctx.load_cert_chain(certfile=CERT_FILE, keyfile=KEY_FILE)
 
-    # Accept any spoofed SNI / Bug Host from client
     def sni_callback(ssl_sock, server_name, ssl_context):
         return None
 
