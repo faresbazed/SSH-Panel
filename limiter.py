@@ -29,13 +29,11 @@ def check_and_enforce():
         except Exception:
             continue
 
-        # Lock expired SSH users
         if expiry < today:
             subprocess.run(["usermod", "-L", username], stderr=subprocess.DEVNULL)
             subprocess.run(["pkill", "-u", username], stderr=subprocess.DEVNULL)
             continue
 
-        # Count active SSH processes for user
         try:
             out = subprocess.check_output(
                 ["pgrep", "-u", username, "sshd|dropbear"], stderr=subprocess.DEVNULL
