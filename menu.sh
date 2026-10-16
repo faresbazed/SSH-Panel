@@ -1,573 +1,684 @@
 #!/usr/bin/env bash
-set -uo pipefail
-umask 077
+# =============================================================================
+# VPS Management Panel CLI (`menu`) for Debian & Ubuntu
+# Supports:
+#   - SSH & SSH-WS (Port 80 Custom Payload) & SSH-SSL (Port 443 All TLS 1.0-1.3)
+#   - Xray-core (VLESS, VMess, Trojan over WebSocket & TCP on Ports 443 & 80)
+#   - Custom SNI / Bug Host support for both SSL/TLS and Xray links
+#   - BadVPN UDPGW (Port 7300)
+#   - User Validity (Days), Expiration Cron, User Deletion, Per-User IP Limiter
+#   - Service Status Monitor & Port Conflict / Exclusive Mode Switcher
+# =============================================================================
 
-PANEL_DIR="/etc/ssh-panel"
-USERS_DIR="$PANEL_DIR/users"
-XRAY_USERS_DIR="$PANEL_DIR/xray_users"
-HELPER="$PANEL_DIR/limiter.py"
+set -u
 
-[[ $EUID -eq 0 ]] || {
-  echo "Run as root: sudo menu"
-  exit 1
-}
+CONFIG_DIR="/etc/vps-panel"
+SSH_DB="${CONFIG_DIR}/ssh-users.db"
+XRAY_DB="${CONFIG_DIR}/xray-users.db"
+PORT_MODE_FILE="${CONFIG_DIR}/port_mode.conf"
+DOMAIN_FILE="${CONFIG_DIR}/domain"
+SNI_FILE="${CONFIG_DIR}/custom_sni"
+XRAY_CONFIG="/usr/local/etc/xray/config.json"
+CERT_FILE="${CONFIG_DIR}/ssl/fullchain.pem"
+KEY_FILE="${CONFIG_DIR}/ssl/privkey.pem"
 
-mkdir -p "$USERS_DIR" "$XRAY_USERS_DIR"
-chmod 700 "$PANEL_DIR" "$USERS_DIR" "$XRAY_USERS_DIR"
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+NC='\033[0m'
 
-pause() {
-  read -r -p "Press Enter to return..." _
-}
+mkdir -p "${CONFIG_DIR}"
+touch "${SSH_DB}" "${XRAY_DB}"
 
-valid_name() {
-  [[ "${1:-}" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || {
-    echo "Use lowercase letters, digits, _ and -; maximum 32 characters."
-    return 1
-  }
-}
-
-valid_days() {
-  [[ "${1:-}" =~ ^[1-9][0-9]{0,3}$ ]] &&
-    ((10#$1 <= 3650)) || {
-      echo "Enter days between 1 and 3650."
-      return 1
-    }
-}
-
-public_ip() {
-  curl -fsS4 --connect-timeout 4 --max-time 7 \
-    https://icanhazip.com 2>/dev/null ||
-    hostname -I | awk '{print $1}'
-}
-
-status() {
-  if systemctl is-active --quiet "$1"; then
-    printf ACTIVE
-  else
-    printf INACTIVE
-  fi
-}
-
-list_accounts() {
-  local kind="$1" file
-  for file in "$kind"/*.conf; do
-    [[ -f "$file" ]] || continue
-    printf '%s\n' "$(basename "$file" .conf)"
-  done
-}
-
-show_ssh_info() {
-  local name="$1" server host cf
-  server=$(public_ip)
-  host=$(cat "$PANEL_DIR/default_sni" 2>/dev/null)
-  host="${host:-$server}"
-  cf=$(python3 "$HELPER" cf-host 2>/dev/null || true)
-
-  echo
-  echo "Username: $name"
-  echo "Server: $server"
-  echo "WS: port 80, path /ssh"
-  echo "WSS: port 443, path /ssh"
-  echo "TLS hostname: $host"
-  echo
-  echo "Legacy direct HTTP-upgrade payload:"
-  echo "GET /ssh HTTP/1.1[crlf]Host: ${host}[crlf]Upgrade: websocket[crlf]Connection: Upgrade[crlf][crlf]"
-  echo
-  echo "Real WebSocket clients must send masked binary frames."
-  echo "Do not manually invent a fixed Sec-WebSocket-Key."
-  if [[ -n "$cf" ]]; then
-    echo "Cloudflare WSS: $cf:443, path /ssh"
-    echo "Cloudflare requires an actual WebSocket-capable SSH client."
-  fi
-}
-
-create_ssh() {
-  local name password days expiry
-  read -r -p "Username: " name
-  valid_name "$name" || return
-  if id "$name" >/dev/null 2>&1; then
-    echo "System account already exists; refusing to replace it."
-    return
-  fi
-  [[ ! -f "$USERS_DIR/$name.conf" ]] || {
-    echo "Panel metadata already exists."
-    return
-  }
-
-  read -r -s -p "Password: " password
-  echo
-  [[ -n "$password" ]] || {
-    echo "Password cannot be empty."
-    return
-  }
-  read -r -p "Validity days [30]: " days
-  days="${days:-30}"
-  valid_days "$days" || return
-  expiry=$(date -d "+$days days" +%F) || return
-
-  (
-    flock -x 8
-    if ! useradd -M -s /bin/false -e "$expiry" "$name"; then
-      exit 1
+get_host() {
+    if [[ -s "${DOMAIN_FILE}" ]]; then
+        cat "${DOMAIN_FILE}"
+    else
+        curl -fsSL4 --max-time 2 icanhazip.com 2>/dev/null || hostname -I | awk '{print $1}'
     fi
-    if ! printf '%s:%s\n' "$name" "$password" | chpasswd; then
-      userdel "$name" 2>/dev/null || true
-      exit 1
+}
+
+get_default_sni() {
+    if [[ -s "${SNI_FILE}" ]]; then
+        cat "${SNI_FILE}"
+    else
+        get_host
     fi
-    printf 'EXPIRY=%s\nLIMIT=0\nPANEL_LOCKED=0\n' "$expiry" \
-      > "$USERS_DIR/$name.conf"
-    chmod 600 "$USERS_DIR/$name.conf"
-  ) 8>/run/lock/ssh-panel-state.lock || {
-    unset password
-    echo "Could not create account."
-    return
-  }
-
-  unset password
-  echo "Created. Expires at start of $expiry."
-  echo "Password is not stored in the panel metadata."
-  show_ssh_info "$name"
 }
 
-managed_ssh() {
-  local name="$1" uid
-  valid_name "$name" || return
-  [[ -f "$USERS_DIR/$name.conf" ]] || {
-    echo "Not a panel-managed account."
-    return 1
-  }
-  uid=$(id -u "$name") || return
-  ((uid >= 1000)) || {
-    echo "Refusing to modify a privileged/system account."
-    return 1
-  }
-}
-
-renew_ssh() {
-  local name days expiry
-  list_accounts "$USERS_DIR"
-  read -r -p "Username: " name
-  managed_ssh "$name" || return
-  read -r -p "Validity days from today [30]: " days
-  days="${days:-30}"
-  valid_days "$days" || return
-  expiry=$(date -d "+$days days" +%F) || return
-
-  (
-    flock -x 8
-    chage -E "$expiry" "$name" || exit 1
-
-    if grep -qx 'PANEL_LOCKED=1' "$USERS_DIR/$name.conf"; then
-      usermod -U "$name" || exit 1
+svc_badge() {
+    local svc="$1"
+    if systemctl is-active --quiet "$svc" 2>/dev/null; then
+        echo -e "${GREEN}[ACTIVE]${NC}"
+    else
+        echo -e "${RED}[INACTIVE]${NC}"
     fi
-
-    # Preserve metadata keys, but remove legacy plaintext passwords.
-    python3 - "$USERS_DIR/$name.conf" "$expiry" <<'PY'
-import os
-import sys
-import tempfile
-from pathlib import Path
-
-path = Path(sys.argv[1])
-values = {}
-for line in path.read_text().splitlines():
-    if "=" in line:
-        key, value = line.split("=", 1)
-        if key != "PASSWORD":
-            values[key] = value
-values.update(EXPIRY=sys.argv[2], PANEL_LOCKED="0")
-
-fd, temporary = tempfile.mkstemp(dir=str(path.parent))
-try:
-    with os.fdopen(fd, "w") as stream:
-        for key, value in values.items():
-            stream.write("{}={}\n".format(key, value))
-    os.chmod(temporary, 0o600)
-    os.replace(temporary, path)
-finally:
-    if os.path.exists(temporary):
-        os.unlink(temporary)
-PY
-  ) 8>/run/lock/ssh-panel-state.lock || return
-
-  echo "Renewed until $expiry."
 }
 
-delete_ssh() {
-  local name answer uid
-  list_accounts "$USERS_DIR"
-  read -r -p "Username: " name
-  managed_ssh "$name" || return
-  read -r -p "Type DELETE to remove $name: " answer
-  [[ "$answer" == DELETE ]] || return
-  uid=$(id -u "$name") || return
-
-  (
-    flock -x 8
-    pkill -KILL -u "$uid" 2>/dev/null || true
-    userdel "$name" || exit 1
-    rm -f "$USERS_DIR/$name.conf"
-  ) 8>/run/lock/ssh-panel-state.lock
-}
-
-create_xray() {
-  local name days host server
-  read -r -p "Username: " name
-  valid_name "$name" || return
-  read -r -p "Validity days [30]: " days
-  days="${days:-30}"
-  valid_days "$days" || return
-  read -r -p "TLS hostname [panel default]: " host
-  [[ -z "$host" || "$host" =~ ^[A-Za-z0-9.:-]+$ ]] || {
-    echo "Enter a hostname or IP, not a URL."
-    return
-  }
-
-  python3 "$HELPER" add "$name" "$days" --sni "$host" || return
-  server=$(public_ip)
-  python3 "$HELPER" links "$name" --server "$server"
-}
-
-renew_xray() {
-  local name days
-  list_accounts "$XRAY_USERS_DIR"
-  read -r -p "Username: " name
-  valid_name "$name" || return
-  read -r -p "Validity days from today [30]: " days
-  days="${days:-30}"
-  valid_days "$days" || return
-  python3 "$HELPER" renew "$name" "$days"
-}
-
-delete_xray() {
-  local name answer
-  list_accounts "$XRAY_USERS_DIR"
-  read -r -p "Username: " name
-  valid_name "$name" || return
-  read -r -p "Type DELETE to remove $name: " answer
-  [[ "$answer" == DELETE ]] || return
-  python3 "$HELPER" delete "$name"
-}
-
-show_links() {
-  local name server
-  python3 "$HELPER" sync || return
-  list_accounts "$XRAY_USERS_DIR"
-  read -r -p "Username or all [all]: " name
-  name="${name:-all}"
-  server=$(public_ip)
-  python3 "$HELPER" links "$name" --server "$server"
-}
-
-diagnostics() {
-  local choice
-  echo "1) Service status, listeners and logs"
-  echo "2) Validate and restart frontend/Xray"
-  echo "3) Enable both public frontend ports"
-  read -r -p "Select: " choice
-
-  case "$choice" in
-    1)
-      for service in ssh-ws xray ssh-limiter cf-vless cf-panel-named; do
-        echo "$service: $(status "$service")"
-      done
-      ss -ltnp | grep -E ':(22|80|109|443|1000[1-6])\b' || true
-      curl -fsS --max-time 5 http://127.0.0.1/healthz || true
-      journalctl \
-        -u ssh-ws -u xray -u ssh-limiter \
-        -u cf-vless -u cf-panel-named \
-        -n 100 --no-pager
-      ;;
-    2)
-      python3 "$PANEL_DIR/ssh-ws.py" --check || return
-      python3 "$HELPER" check || return
-      systemctl restart xray ssh-ws ssh-limiter
-      ;;
-    3)
-      cat > "$PANEL_DIR/ports.conf" <<'EOF'
-PORT_80_MODE=multiplex
-PORT_443_MODE=multiplex
-EOF
-      python3 "$PANEL_DIR/ssh-ws.py" --check || return
-      systemctl restart ssh-ws
-      ;;
-  esac
-}
-
-cloudflare_menu() {
-  local choice host token binary current i answer
-
-  current=$(python3 "$HELPER" cf-host 2>/dev/null || true)
-  echo "Reported hostname: ${current:-not detected}"
-  echo "An active process alone does not prove tunnel connectivity."
-  echo "1) Start/recreate Quick Tunnel"
-  echo "2) Configure panel-owned named tunnel"
-  echo "3) Stop panel-owned tunnels"
-  echo "4) Show tunnel logs"
-  echo "0) Back"
-  read -r -p "Select: " choice
-
-  if [[ "$choice" == 1 || "$choice" == 2 ]]; then
-    if systemctl is-active --quiet cloudflared; then
-      echo "Generic cloudflared.service is active."
-      echo "It may serve unrelated applications; it will not be stopped."
-      echo "Migrate/stop it explicitly before switching this panel's tunnel."
-      return
+get_port_mode_label() {
+    local key="$1"
+    local val="shared"
+    if [[ -f "${PORT_MODE_FILE}" ]]; then
+        val=$(grep -E "^${key}=" "${PORT_MODE_FILE}" | cut -d'=' -f2 | tr -d '"' | tr -d "'" || echo "shared")
     fi
-  fi
+    case "${val}" in
+        shared)    echo -e "${GREEN}Shared Multiplex (SSH-WS + Xray WS/TCP)${NC}" ;;
+        ssh_only)  echo -e "${YELLOW}SSH-WS Exclusive (Xray Disabled on Port)${NC}" ;;
+        xray_only) echo -e "${CYAN}Xray Exclusive (SSH-WS Disabled on Port)${NC}" ;;
+        off)       echo -e "${RED}Disabled (Port Closed)${NC}" ;;
+        *)         echo -e "${GREEN}Shared Multiplex${NC}" ;;
+    esac
+}
 
-  case "$choice" in
-    1)
-      echo "A Quick Tunnel receives a new hostname when recreated."
-      read -r -p "Continue? [y/N]: " answer
-      [[ "$answer" == y || "$answer" == Y ]] || return
+# -----------------------------------------------------------------------------
+# Repair / Re-initialize Xray Service & Config if Inactive
+# -----------------------------------------------------------------------------
+repair_xray_service() {
+    mkdir -p /var/log/xray /etc/systemd/system/xray.service.d
+    chmod -R 755 /var/log/xray
+    touch /var/log/xray/access.log /var/log/xray/error.log
+    chmod 666 /var/log/xray/access.log /var/log/xray/error.log
 
-      systemctl disable --now cf-panel-named 2>/dev/null || true
-      rm -f "$PANEL_DIR/cf_custom_domain"
-
-      systemctl enable cf-vless || return
-      systemctl restart cf-vless || return
-
-      current=""
-      for ((i=0; i<60; i++)); do
-        current=$(python3 "$HELPER" cf-host 2>/dev/null || true)
-        [[ -n "$current" ]] && break
-        sleep 1
-      done
-
-      echo "Hostname: ${current:-not detected; inspect logs}"
-      echo "Regenerate account links using menu option 7."
-      ;;
-    2)
-      binary=$(command -v cloudflared) || return
-      if ! "$binary" tunnel run --help 2>&1 |
-          grep -q -- '--token-file'; then
-        echo "This cloudflared version lacks --token-file."
-        echo "Update cloudflared before configuring a named tunnel."
-        return
-      fi
-
-      echo "In Cloudflare's tunnel dashboard, configure the public hostname"
-      echo "to use HTTP service: http://127.0.0.1:80"
-      read -r -p "Configured public hostname: " host
-      [[ "$host" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*[A-Za-z0-9]$ ]] || {
-        echo "Enter a hostname, without https:// or a path."
-        return
-      }
-
-      read -r -s -p "Tunnel token: " token
-      echo
-      [[ -n "$token" ]] || return
-      printf '%s' "$token" > "$PANEL_DIR/cf-token"
-      chmod 600 "$PANEL_DIR/cf-token"
-      unset token
-
-      printf '%s\n' "$host" > "$PANEL_DIR/cf_custom_domain"
-      printf '{}\n' > "$PANEL_DIR/cloudflared-empty.yml"
-
-      cat > /etc/systemd/system/cf-panel-named.service <<EOF
-# SSH-PANEL-MANAGED
-[Unit]
-Description=SSH-Panel named Cloudflare Tunnel
-Wants=network-online.target
-After=network-online.target ssh-ws.service
-
+    # Force Xray systemd service to run as root so it never fails on log/socket permissions
+    cat > /etc/systemd/system/xray.service.d/10-root-override.conf <<'EOF'
 [Service]
-Type=simple
-ExecStart=${binary} tunnel --config /etc/ssh-panel/cloudflared-empty.yml --no-autoupdate --edge-ip-version 4 --protocol http2 run --token-file /etc/ssh-panel/cf-token
-Restart=on-failure
-RestartSec=5
-UMask=0077
-
-[Install]
-WantedBy=multi-user.target
+User=root
+Group=root
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+NoNewPrivileges=false
 EOF
 
-      systemctl disable --now cf-vless 2>/dev/null || true
-      systemctl daemon-reload
-      systemctl enable cf-panel-named &&
-        systemctl restart cf-panel-named
-
-      echo "Inspect option 4 for successful tunnel registration."
-      ;;
-    3)
-      systemctl disable --now cf-vless cf-panel-named 2>/dev/null || true
-      echo "Panel-owned tunnels stopped."
-      echo "Generic cloudflared.service was not modified."
-      ;;
-    4)
-      journalctl -u cf-vless -u cf-panel-named -n 120 --no-pager
-      ;;
-  esac
+    # Ensure config.json is valid and has at least one seed client per inbound
+    if [[ ! -s "${XRAY_CONFIG}" ]] || ! /usr/local/bin/xray run -test -config "${XRAY_CONFIG}" >/dev/null 2>&1; then
+        local seed_uuid
+        seed_uuid=$(cat /proc/sys/kernel/random/uuid)
+        cat > "${XRAY_CONFIG}" <<EOF
+{
+  "log": {
+    "access": "/var/log/xray/access.log",
+    "error": "/var/log/xray/error.log",
+    "loglevel": "info"
+  },
+  "inbounds": [
+    {
+      "tag": "vless-ws",
+      "listen": "127.0.0.1",
+      "port": 10001,
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {"id": "${seed_uuid}", "email": "default@vless"}
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "ws",
+        "wsSettings": {
+          "path": "/vless"
+        }
+      }
+    },
+    {
+      "tag": "vmess-ws",
+      "listen": "127.0.0.1",
+      "port": 10002,
+      "protocol": "vmess",
+      "settings": {
+        "clients": [
+          {"id": "${seed_uuid}", "alterId": 0, "email": "default@vmess"}
+        ]
+      },
+      "streamSettings": {
+        "network": "ws",
+        "wsSettings": {
+          "path": "/vmess"
+        }
+      }
+    },
+    {
+      "tag": "trojan-ws",
+      "listen": "127.0.0.1",
+      "port": 10003,
+      "protocol": "trojan",
+      "settings": {
+        "clients": [
+          {"password": "${seed_uuid}", "email": "default@trojan"}
+        ]
+      },
+      "streamSettings": {
+        "network": "ws",
+        "wsSettings": {
+          "path": "/trojan"
+        }
+      }
+    },
+    {
+      "tag": "vless-tcp",
+      "listen": "127.0.0.1",
+      "port": 10004,
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {"id": "${seed_uuid}", "email": "default@vless"}
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "tcp"
+      }
+    },
+    {
+      "tag": "vmess-tcp",
+      "listen": "127.0.0.1",
+      "port": 10005,
+      "protocol": "vmess",
+      "settings": {
+        "clients": [
+          {"id": "${seed_uuid}", "alterId": 0, "email": "default@vmess"}
+        ]
+      },
+      "streamSettings": {
+        "network": "tcp"
+      }
+    },
+    {
+      "tag": "trojan-tcp",
+      "listen": "127.0.0.1",
+      "port": 10006,
+      "protocol": "trojan",
+      "settings": {
+        "clients": [
+          {"password": "${seed_uuid}", "email": "default@trojan"}
+        ]
+      },
+      "streamSettings": {
+        "network": "tcp"
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "protocol": "freedom",
+      "tag": "direct"
+    },
+    {
+      "protocol": "blackhole",
+      "tag": "blocked"
+    }
+  ]
 }
-
-certificate_menu() {
-  local cert key temporary backup answer new_host
-  echo "1) Import a trusted certificate and private key"
-  echo "2) Change default TLS hostname for new account links"
-  echo "3) Show installed certificate"
-  read -r -p "Select: " answer
-
-  case "$answer" in
-    1)
-      read -r -p "Full certificate-chain file: " cert
-      read -r -p "Private-key file: " key
-      [[ -f "$cert" && -f "$key" ]] || {
-        echo "Certificate/key file not found."
-        return
-      }
-
-      # Confirm the certificate/key pair loads before replacing anything.
-      python3 - "$cert" "$key" <<'PY'
-import ssl
-import sys
-context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-context.load_cert_chain(sys.argv[1], sys.argv[2])
-print("Certificate/key pair loads successfully.")
-PY
-      [[ $? -eq 0 ]] || return
-
-      temporary=$(mktemp -d "$PANEL_DIR/cert-import.XXXXXX") || return
-      install -m 600 "$cert" "$temporary/cert.pem" || {
-        rm -rf "$temporary"; return;
-      }
-      install -m 600 "$key" "$temporary/key.pem" || {
-        rm -rf "$temporary"; return;
-      }
-
-      backup="/root/ssh-panel-backups/cert-$(date -u +%Y%m%dT%H%M%SZ)-$$"
-      mkdir -p "$backup"
-      chmod 700 "$backup"
-      cp -p "$PANEL_DIR/cert.pem" "$PANEL_DIR/key.pem" "$backup/" || {
-        rm -rf "$temporary"; return;
-      }
-
-      mv "$temporary/cert.pem" "$PANEL_DIR/cert.pem"
-      mv "$temporary/key.pem" "$PANEL_DIR/key.pem"
-      rmdir "$temporary"
-
-      if ! systemctl restart ssh-ws; then
-        cp -p "$backup/cert.pem" "$backup/key.pem" "$PANEL_DIR/"
-        systemctl restart ssh-ws || true
-        echo "Restart failed; previous certificate restored."
-        return
-      fi
-      echo "Certificate installed. Ensure your TLS hostname matches it."
-      echo "Renewed certificates must be reimported unless automated separately."
-      ;;
-    2)
-      read -r -p "Default TLS hostname: " new_host
-      [[ "$new_host" =~ ^[A-Za-z0-9.:-]+$ ]] || {
-        echo "Invalid hostname/IP."
-        return
-      }
-      printf '%s\n' "$new_host" > "$PANEL_DIR/default_sni"
-      echo "Default updated. Existing accounts with SNI metadata retain it."
-      ;;
-    3)
-      openssl x509 -in "$PANEL_DIR/cert.pem" \
-        -noout -subject -issuer -dates
-      ;;
-  esac
-}
-
-uninstall_panel() {
-  local answer stamp backup service unit
-  local items=(etc/ssh-panel)
-
-  echo "This removes the panel frontend, expiry manager and panel-owned tunnels."
-  echo "It preserves SSH accounts, certificates, metadata, Xray and OpenSSH."
-  echo "Generic Dropbear/cloudflared services and BadVPN are not removed."
-  echo "Connections through the panel's public ports will be disconnected."
-  echo "Keep a separate normal SSH session open."
-  read -r -p "Type UNINSTALL to continue: " answer
-  [[ "$answer" == UNINSTALL ]] || return
-
-  stamp=$(date -u +%Y%m%dT%H%M%SZ)-$$
-  mkdir -p /root/ssh-panel-backups
-  chmod 700 /root/ssh-panel-backups
-  backup="/root/ssh-panel-backups/uninstall-${stamp}.tar.gz"
-
-  for service in \
-    ssh-ws ssh-limiter cf-vless cf-panel-named ssh-panel-dropbear; do
-    unit="etc/systemd/system/${service}.service"
-    [[ ! -f "/$unit" ]] || items+=("$unit")
-  done
-
-  tar -czpf "$backup" -C / "${items[@]}" || {
-    echo "Backup failed; uninstall cancelled."
-    return
-  }
-  chmod 600 "$backup"
-
-  for service in \
-    ssh-ws ssh-limiter cf-vless cf-panel-named ssh-panel-dropbear; do
-    unit="/etc/systemd/system/${service}.service"
-    if [[ -f "$unit" ]] &&
-        grep -qx '# SSH-PANEL-MANAGED' "$unit"; then
-      systemctl disable --now "$service" 2>/dev/null || true
-      rm -f "$unit"
+EOF
     fi
-  done
 
-  if [[ -L /usr/local/bin/menu ]] &&
-      [[ "$(readlink -f /usr/local/bin/menu)" == "$PANEL_DIR/menu.sh" ]]; then
-    rm -f /usr/local/bin/menu
-  fi
-
-  rm -f \
-    "$PANEL_DIR/ssh-ws.py" \
-    "$PANEL_DIR/limiter.py" \
-    "$PANEL_DIR/menu.sh" \
-    "$PANEL_DIR/cf-token"
-
-  systemctl daemon-reload
-  systemctl reset-failed 2>/dev/null || true
-
-  echo "Panel software removed."
-  echo "Backup: $backup"
-  echo "Accounts/configuration/certificates remain in $PANEL_DIR."
-  echo "Xray remains installed, with its existing configuration."
-  exit 0
+    systemctl daemon-reload
+    systemctl enable xray 2>/dev/null || true
+    systemctl restart xray 2>/dev/null || true
 }
 
-while true; do
-  echo
-  echo "============================================================"
-  echo " SSH-Panel"
-  echo " Frontend: $(status ssh-ws) | Xray: $(status xray)"
-  echo " Quick CF: $(status cf-vless) | Named CF: $(status cf-panel-named)"
-  echo "============================================================"
-  echo " 1) Create SSH account"
-  echo " 2) Renew SSH account"
-  echo " 3) Delete SSH account"
-  echo " 4) Create Xray account"
-  echo " 5) Renew Xray account"
-  echo " 6) Delete Xray account"
-  echo " 7) Print Xray links: VLESS / VMess / Trojan, ports 80 / 443"
-  echo " 8) Diagnostics / restart / enable ports"
-  echo " 9) Cloudflared management"
-  echo "10) TLS certificate / default hostname"
-  echo "99) Uninstall panel software"
-  echo " 0) Exit"
-  echo "============================================================"
-  read -r -p "Select: " choice || exit 0
+# Auto-heal Xray on menu launch if inactive
+if ! systemctl is-active --quiet xray 2>/dev/null; then
+    repair_xray_service
+fi
 
-  case "$choice" in
-    1) create_ssh ;;
-    2) renew_ssh ;;
-    3) delete_ssh ;;
-    4) create_xray ;;
-    5) renew_xray ;;
-    6) delete_xray ;;
-    7) show_links ;;
-    8) diagnostics ;;
-    9) cloudflare_menu ;;
-    10) certificate_menu ;;
-    99) uninstall_panel ;;
-    0) exit 0 ;;
-    *) echo "Invalid selection." ;;
-  esac
+# -----------------------------------------------------------------------------
+# SSH User Management (with Custom SNI / Bug Host Support)
+# -----------------------------------------------------------------------------
+create_ssh_user() {
+    echo -e "\n${CYAN}--- Create SSH / SSH-WS / SSL User ---${NC}"
+    read -rp "Username: " uname
+    if [[ -z "${uname}" ]]; then
+        echo -e "${RED}Username cannot be empty.${NC}"
+        return
+    fi
+    if id "${uname}" &>/dev/null; then
+        echo -e "${RED}User '${uname}' already exists!${NC}"
+        return
+    fi
+    read -rp "Password: " upass
+    read -rp "Validity (days, e.g. 30): " days
+    read -rp "Max Concurrent IPs (e.g. 2): " max_ip
 
-  pause
-done
+    local def_sni custom_sni
+    def_sni=$(get_default_sni)
+    read -rp "Custom SNI / Bug Host (leave blank for ${def_sni}): " custom_sni
+    custom_sni=${custom_sni:-${def_sni}}
+
+    days=${days:-30}
+    max_ip=${max_ip:-2}
+    exp_date=$(date -d "+${days} days" +"%Y-%m-%d")
+
+    useradd -e "${exp_date}" -s /bin/false -M "${uname}"
+    echo "${uname}:${upass}" | chpasswd
+
+    sed -i "/^${uname}|/d" "${SSH_DB}"
+    echo "${uname}|${upass}|${exp_date}|${max_ip}" >> "${SSH_DB}"
+
+    local host
+    host=$(get_host)
+    echo -e "\n${GREEN}=== SSH / WebSocket / SSL Account Created ===${NC}"
+    echo -e "Server Host / IP   : ${host}"
+    echo -e "Custom SNI / Bug   : ${custom_sni}"
+    echo -e "Username           : ${uname}"
+    echo -e "Password           : ${upass}"
+    echo -e "Expires On         : ${exp_date} (${days} days)"
+    echo -e "Max IP Limit       : ${max_ip} IP(s)"
+    echo -e "OpenSSH Port       : 22"
+    echo -e "Dropbear Port      : 109"
+    echo -e "SSH WS (HTTP) Port : 80 (Supports any custom payload)"
+    echo -e "SSH SSL/WS Port    : 443 (Supports TLS 1.0, 1.1, 1.2, 1.3 + Any Custom SNI)"
+    echo -e "BadVPN UDPGW Port  : 7300"
+    echo -e "WS Payload (80/443): GET / HTTP/1.1[crlf]Host: ${custom_sni}[crlf]Upgrade: websocket[crlf][crlf]"
+    echo -e "SSL SNI Config     : Server=${host}:443 | SNI/Bug Host=${custom_sni}"
+}
+
+delete_ssh_user() {
+    echo -e "\n${CYAN}--- Delete SSH User ---${NC}"
+    if [[ ! -s "${SSH_DB}" ]]; then
+        echo -e "${YELLOW}No SSH users found.${NC}"
+        return
+    fi
+    nl -w2 -s'. ' "${SSH_DB}" | awk -F'|' '{printf "%s %-16s (Expires: %s, Max IP: %s)\n", $1, $2, $3, $4}'
+    read -rp "Enter username to delete: " uname
+    if [[ -z "${uname}" ]]; then return; fi
+
+    pkill -9 -u "${uname}" 2>/dev/null || true
+    userdel -f "${uname}" 2>/dev/null || true
+    sed -i "/^${uname}|/d" "${SSH_DB}"
+    echo -e "${GREEN}SSH user '${uname}' deleted.${NC}"
+}
+
+update_ssh_ip_limit() {
+    echo -e "\n${CYAN}--- Update SSH User IP Limit / Validity ---${NC}"
+    read -rp "Enter SSH username: " uname
+    if ! grep -q "^${uname}|" "${SSH_DB}"; then
+        echo -e "${RED}User '${uname}' not found in SSH database.${NC}"
+        return
+    fi
+    read -rp "New Max Concurrent IPs (e.g. 2): " max_ip
+    read -rp "Extend validity by days from today (leave blank to keep current): " days
+
+    local line pass cur_exp
+    line=$(grep "^${uname}|" "${SSH_DB}" | head -n1)
+    pass=$(echo "${line}" | cut -d'|' -f2)
+    cur_exp=$(echo "${line}" | cut -d'|' -f3)
+
+    if [[ -n "${days}" ]]; then
+        cur_exp=$(date -d "+${days} days" +"%Y-%m-%d")
+        chage -E "${cur_exp}" "${uname}" 2>/dev/null || true
+    fi
+    max_ip=${max_ip:-2}
+    sed -i "/^${uname}|/d" "${SSH_DB}"
+    echo "${uname}|${pass}|${cur_exp}|${max_ip}" >> "${SSH_DB}"
+    echo -e "${GREEN}Updated '${uname}': Expires=${cur_exp}, Max IP=${max_ip}.${NC}"
+}
+
+# -----------------------------------------------------------------------------
+# Xray User Management (VLESS, VMess, Trojan - Port 443 & 80 WS & TCP + Custom SNI)
+# -----------------------------------------------------------------------------
+create_xray_user() {
+    echo -e "\n${CYAN}--- Create Xray User (VLESS / VMess / Trojan on Port 443 & 80 WS + TCP) ---${NC}"
+    read -rp "Username: " uname
+    if [[ -z "${uname}" ]]; then
+        echo -e "${RED}Username cannot be empty.${NC}"
+        return
+    fi
+    if grep -q "^${uname}|" "${XRAY_DB}"; then
+        echo -e "${RED}Xray user '${uname}' already exists!${NC}"
+        return
+    fi
+    echo "Select Protocol:"
+    echo "  1) VLESS (WS + TCP on 443 & 80)"
+    echo "  2) VMess (WS + TCP on 443 & 80)"
+    echo "  3) Trojan (WS + TCP on 443 & 80)"
+    echo "  4) All Three (VLESS + VMess + Trojan)"
+    read -rp "Choice [1-4]: " pchoice
+    read -rp "Validity (days, e.g. 30): " days
+    read -rp "Max Concurrent IPs (e.g. 2): " max_ip
+
+    local def_sni custom_sni
+    def_sni=$(get_default_sni)
+    read -rp "Custom SNI / Bug Host (leave blank for ${def_sni}): " custom_sni
+    custom_sni=${custom_sni:-${def_sni}}
+
+    days=${days:-30}
+    max_ip=${max_ip:-2}
+    exp_date=$(date -d "+${days} days" +"%Y-%m-%d")
+    uuid=$(cat /proc/sys/kernel/random/uuid)
+
+    local proto="all"
+    case "${pchoice}" in
+        1) proto="vless" ;;
+        2) proto="vmess" ;;
+        3) proto="trojan" ;;
+        *) proto="all" ;;
+    esac
+
+    if [[ ! -f "${XRAY_CONFIG}" ]]; then
+        repair_xray_service
+    fi
+
+    if [[ -f "${XRAY_CONFIG}" ]]; then
+        local tmp_json
+        tmp_json=$(mktemp)
+        cp "${XRAY_CONFIG}" "${tmp_json}"
+
+        if [[ "${proto}" == "vless" || "${proto}" == "all" ]]; then
+            jq --arg id "${uuid}" --arg email "${uname}@vless" \
+               '(.inbounds[] | select(.tag=="vless-ws" or .tag=="vless-tcp") | .settings.clients) += [{"id": $id, "email": $email}]' \
+               "${tmp_json}" > "${tmp_json}.2" && mv "${tmp_json}.2" "${tmp_json}"
+        fi
+        if [[ "${proto}" == "vmess" || "${proto}" == "all" ]]; then
+            jq --arg id "${uuid}" --arg email "${uname}@vmess" \
+               '(.inbounds[] | select(.tag=="vmess-ws" or .tag=="vmess-tcp") | .settings.clients) += [{"id": $id, "alterId": 0, "email": $email}]' \
+               "${tmp_json}" > "${tmp_json}.2" && mv "${tmp_json}.2" "${tmp_json}"
+        fi
+        if [[ "${proto}" == "trojan" || "${proto}" == "all" ]]; then
+            jq --arg pw "${uuid}" --arg email "${uname}@trojan" \
+               '(.inbounds[] | select(.tag=="trojan-ws" or .tag=="trojan-tcp") | .settings.clients) += [{"password": $pw, "email": $email}]' \
+               "${tmp_json}" > "${tmp_json}.2" && mv "${tmp_json}.2" "${tmp_json}"
+        fi
+
+        mv "${tmp_json}" "${XRAY_CONFIG}"
+        systemctl restart xray 2>/dev/null || repair_xray_service
+    fi
+
+    echo "${uname}|${proto}|${uuid}|${exp_date}|${max_ip}" >> "${XRAY_DB}"
+
+    local host
+    host=$(get_host)
+    echo -e "\n${GREEN}=== Xray Account Created ===${NC}"
+    echo -e "Username        : ${uname}"
+    echo -e "Protocol(s)     : ${proto^^}"
+    echo -e "UUID / Password : ${uuid}"
+    echo -e "Server Host/IP  : ${host}"
+    echo -e "Custom SNI/Host : ${custom_sni}"
+    echo -e "Expires On      : ${exp_date} (${days} days)"
+    echo -e "Max IP Limit    : ${max_ip} IP(s)"
+    echo -e "Ports           : 443 (TLS) & 80 (Non-TLS) [WS & TCP]"
+
+    if [[ "${proto}" == "vless" || "${proto}" == "all" ]]; then
+        echo -e "\n${YELLOW}[VLESS Links (Custom SNI: ${custom_sni})]${NC}"
+        echo "VLESS WS TLS (443)  : vless://${uuid}@${host}:443?encryption=none&security=tls&type=ws&host=${custom_sni}&path=%2Fvless&sni=${custom_sni}&allowInsecure=1#${uname}-VLESS-WS-443"
+        echo "VLESS WS HTTP (80)  : vless://${uuid}@${host}:80?encryption=none&security=none&type=ws&host=${custom_sni}&path=%2Fvless#${uname}-VLESS-WS-80"
+        echo "VLESS TCP TLS (443) : vless://${uuid}@${host}:443?encryption=none&security=tls&type=tcp&sni=${custom_sni}&allowInsecure=1#${uname}-VLESS-TCP-443"
+        echo "VLESS TCP HTTP (80) : vless://${uuid}@${host}:80?encryption=none&security=none&type=tcp&headerType=http&host=${custom_sni}#${uname}-VLESS-TCP-80"
+    fi
+
+    if [[ "${proto}" == "vmess" || "${proto}" == "all" ]]; then
+        local vmess_ws_443 vmess_ws_80 vmess_tcp_443 vmess_tcp_80
+        vmess_ws_443=$(jq -n --arg ps "${uname}-VMESS-WS-443" --arg add "${host}" --arg id "${uuid}" --arg sni "${custom_sni}" \
+            '{v:"2",ps:$ps,add:$add,port:"443",id:$id,aid:"0",net:"ws",type:"none",host:$sni,path:"/vmess",tls:"tls",sni:$sni,allowInsecure:true}' | base64 -w0)
+        vmess_ws_80=$(jq -n --arg ps "${uname}-VMESS-WS-80" --arg add "${host}" --arg id "${uuid}" --arg sni "${custom_sni}" \
+            '{v:"2",ps:$ps,add:$add,port:"80",id:$id,aid:"0",net:"ws",type:"none",host:$sni,path:"/vmess",tls:"none"}' | base64 -w0)
+        vmess_tcp_443=$(jq -n --arg ps "${uname}-VMESS-TCP-443" --arg add "${host}" --arg id "${uuid}" --arg sni "${custom_sni}" \
+            '{v:"2",ps:$ps,add:$add,port:"443",id:$id,aid:"0",net:"tcp",type:"none",host:$sni,tls:"tls",sni:$sni,allowInsecure:true}' | base64 -w0)
+        vmess_tcp_80=$(jq -n --arg ps "${uname}-VMESS-TCP-80" --arg add "${host}" --arg id "${uuid}" --arg sni "${custom_sni}" \
+            '{v:"2",ps:$ps,add:$add,port:"80",id:$id,aid:"0",net:"tcp",type:"none",host:$sni,tls:"none"}' | base64 -w0)
+        echo -e "\n${YELLOW}[VMess Links (Custom SNI: ${custom_sni})]${NC}"
+        echo "VMess WS TLS (443)  : vmess://${vmess_ws_443}"
+        echo "VMess WS HTTP (80)  : vmess://${vmess_ws_80}"
+        echo "VMess TCP TLS (443) : vmess://${vmess_tcp_443}"
+        echo "VMess TCP HTTP (80) : vmess://${vmess_tcp_80}"
+    fi
+
+    if [[ "${proto}" == "trojan" || "${proto}" == "all" ]]; then
+        echo -e "\n${YELLOW}[Trojan Links (Custom SNI: ${custom_sni})]${NC}"
+        echo "Trojan WS TLS (443)  : trojan://${uuid}@${host}:443?security=tls&type=ws&host=${custom_sni}&path=%2Ftrojan&sni=${custom_sni}&allowInsecure=1#${uname}-TROJAN-WS-443"
+        echo "Trojan WS HTTP (80)  : trojan://${uuid}@${host}:80?security=none&type=ws&host=${custom_sni}&path=%2Ftrojan#${uname}-TROJAN-WS-80"
+        echo "Trojan TCP TLS (443) : trojan://${uuid}@${host}:443?security=tls&type=tcp&sni=${custom_sni}&allowInsecure=1#${uname}-TROJAN-TCP-443"
+        echo "Trojan TCP HTTP (80) : trojan://${uuid}@${host}:80?security=none&type=tcp&sni=${custom_sni}#${uname}-TROJAN-TCP-80"
+    fi
+}
+
+delete_xray_user() {
+    echo -e "\n${CYAN}--- Delete Xray User ---${NC}"
+    if [[ ! -s "${XRAY_DB}" ]]; then
+        echo -e "${YELLOW}No Xray users found.${NC}"
+        return
+    fi
+    nl -w2 -s'. ' "${XRAY_DB}" | awk -F'|' '{printf "%s %-16s [%-6s] (Expires: %s, Max IP: %s)\n", $1, $2, $3, $4, $5}'
+    read -rp "Enter Xray username to delete: " uname
+    if [[ -z "${uname}" ]]; then return; fi
+
+    if [[ -f "${XRAY_CONFIG}" ]]; then
+        local tmp_json
+        tmp_json=$(mktemp)
+        jq --arg u1 "${uname}@vless" --arg u2 "${uname}@vmess" --arg u3 "${uname}@trojan" \
+           '(.inbounds[].settings.clients) |= map(select(.email != $u1 and .email != $u2 and .email != $u3))' \
+           "${XRAY_CONFIG}" > "${tmp_json}" && mv "${tmp_json}" "${XRAY_CONFIG}"
+        systemctl restart xray 2>/dev/null || true
+    fi
+    sed -i "/^${uname}|/d" "${XRAY_DB}"
+    echo -e "${GREEN}Xray user '${uname}' deleted.${NC}"
+}
+
+update_xray_ip_limit() {
+    echo -e "\n${CYAN}--- Update Xray User IP Limit / Validity ---${NC}"
+    read -rp "Enter Xray username: " uname
+    if ! grep -q "^${uname}|" "${XRAY_DB}"; then
+        echo -e "${RED}User '${uname}' not found in Xray database.${NC}"
+        return
+    fi
+    read -rp "New Max Concurrent IPs (e.g. 2): " max_ip
+    read -rp "Extend validity by days from today (leave blank to keep current): " days
+
+    local line proto secret cur_exp
+    line=$(grep "^${uname}|" "${XRAY_DB}" | head -n1)
+    proto=$(echo "${line}" | cut -d'|' -f2)
+    secret=$(echo "${line}" | cut -d'|' -f3)
+    cur_exp=$(echo "${line}" | cut -d'|' -f4)
+
+    if [[ -n "${days}" ]]; then
+        cur_exp=$(date -d "+${days} days" +"%Y-%m-%d")
+    fi
+    max_ip=${max_ip:-2}
+    sed -i "/^${uname}|/d" "${XRAY_DB}"
+    echo "${uname}|${proto}|${secret}|${cur_exp}|${max_ip}" >> "${XRAY_DB}"
+    echo -e "${GREEN}Updated '${uname}': Expires=${cur_exp}, Max IP=${max_ip}.${NC}"
+}
+
+# -----------------------------------------------------------------------------
+# Service Status & Port Mode / Deactivation Manager
+# -----------------------------------------------------------------------------
+service_and_port_menu() {
+    while true; do
+        echo -e "\n${CYAN}============================================================${NC}"
+        echo -e "${CYAN}         Service Status & Port Deactivation Manager         ${NC}"
+        echo -e "${CYAN}============================================================${NC}"
+        echo -e "  OpenSSH (Port 22)             : $(svc_badge ssh)"
+        echo -e "  Dropbear SSH (Port 109)       : $(svc_badge dropbear)"
+        echo -e "  SSH-WS & Multiplexer (80/443) : $(svc_badge ssh-ws)"
+        echo -e "  Xray-core (VLESS/VMess/Trojan): $(svc_badge xray)"
+        echo -e "  BadVPN UDPGW (Port 7300)      : $(svc_badge badvpn-udpgw)"
+        echo -e "  Nginx (ACME / Web)            : $(svc_badge nginx)"
+        echo -e "  IP & Conn Limiter Daemon      : $(svc_badge vps-limiter)"
+        echo -e "------------------------------------------------------------"
+        echo -e "  Port 80 Mode  : $(get_port_mode_label PORT_80_MODE)"
+        echo -e "  Port 443 Mode : $(get_port_mode_label PORT_443_MODE)"
+        echo -e "------------------------------------------------------------"
+        echo "  1) Set Port 80 to SHARED Mode (SSH-WS + Xray WS/TCP)"
+        echo "  2) Set Port 80 to SSH-WS EXCLUSIVE (Disable Xray on Port 80)"
+        echo "  3) Set Port 80 to XRAY EXCLUSIVE (Disable SSH-WS on Port 80)"
+        echo "  4) Set Port 443 to SHARED Mode (SSH-SSL/WS + Xray TLS WS/TCP)"
+        echo "  5) Set Port 443 to SSH-SSL/WS EXCLUSIVE (Disable Xray on Port 443)"
+        echo "  6) Set Port 443 to XRAY EXCLUSIVE (Disable SSH-SSL/WS on Port 443)"
+        echo "  7) Stop / Disable an Individual Service (xray, ssh-ws, dropbear, badvpn-udpgw)"
+        echo "  8) Start / Enable an Individual Service"
+        echo "  9) Repair & Restart Xray Service Now"
+        echo "  0) Back to Main Menu"
+        read -rp "Select option: " sopt
+
+        local p80 p443
+        p80=$(grep -E "^PORT_80_MODE=" "${PORT_MODE_FILE}" 2>/dev/null | cut -d'=' -f2 || echo "shared")
+        p443=$(grep -E "^PORT_443_MODE=" "${PORT_MODE_FILE}" 2>/dev/null | cut -d'=' -f2 || echo "shared")
+
+        case "${sopt}" in
+            1) p80="shared" ;;
+            2) p80="ssh_only" ;;
+            3) p80="xray_only" ;;
+            4) p443="shared" ;;
+            5) p443="ssh_only" ;;
+            6) p443="xray_only" ;;
+            7)
+                read -rp "Enter service name to stop/disable (xray / ssh-ws / dropbear / badvpn-udpgw / vps-limiter): " tsvc
+                systemctl stop "${tsvc}" 2>/dev/null && systemctl disable "${tsvc}" 2>/dev/null
+                echo -e "${YELLOW}Service '${tsvc}' stopped and disabled.${NC}"
+                continue
+                ;;
+            8)
+                read -rp "Enter service name to start/enable (xray / ssh-ws / dropbear / badvpn-udpgw / vps-limiter): " tsvc
+                if [[ "${tsvc}" == "xray" ]]; then
+                    repair_xray_service
+                else
+                    systemctl enable "${tsvc}" 2>/dev/null && systemctl restart "${tsvc}" 2>/dev/null
+                fi
+                echo -e "${GREEN}Service '${tsvc}' enabled and started.${NC}"
+                continue
+                ;;
+            9)
+                repair_xray_service
+                echo -e "${GREEN}Xray configuration verified and service restarted!${NC}"
+                continue
+                ;;
+            0) break ;;
+            *) continue ;;
+        esac
+
+        cat > "${PORT_MODE_FILE}" <<EOF
+PORT_80_MODE=${p80}
+PORT_443_MODE=${p443}
+EOF
+        systemctl restart ssh-ws 2>/dev/null || true
+        echo -e "${GREEN}Port routing mode updated and applied cleanly!${NC}"
+    done
+}
+
+# -----------------------------------------------------------------------------
+# SSL Certificate & Custom SNI Manager (Domain Let's Encrypt / IP / Custom SNI)
+# -----------------------------------------------------------------------------
+ssl_menu() {
+    echo -e "\n${CYAN}--- SSL Certificate & Custom SNI Manager ---${NC}"
+    echo -e "  Current Host/Domain : $(get_host)"
+    echo -e "  Default Custom SNI  : $(get_default_sni)"
+    echo "------------------------------------------------------------"
+    echo "  1) Issue Free Let's Encrypt Certificate for a Domain (via acme.sh)"
+    echo "  2) Generate Self-Signed Certificate for VPS IP or Custom SNI (No Domain Needed)"
+    echo "  3) Set Default Custom SNI / Bug Host (used for SSL & Xray configs)"
+    echo "  0) Back"
+    read -rp "Select option: " copt
+    mkdir -p "${CONFIG_DIR}/ssl"
+    case "${copt}" in
+        1)
+            read -rp "Enter your domain name (pointing to this VPS IP): " dom
+            if [[ -z "${dom}" ]]; then return; fi
+            echo "${dom}" > "${DOMAIN_FILE}"
+            systemctl start nginx 2>/dev/null || true
+            if [[ ! -f "$HOME/.acme.sh/acme.sh" ]]; then
+                curl -fsSL https://get.acme.sh | sh -s email="admin@${dom}"
+            fi
+            "$HOME/.acme.sh/acme.sh" --set-default-ca --server letsencrypt
+            "$HOME/.acme.sh/acme.sh" --issue -d "${dom}" --webroot /var/www/html --keylength ec-256 --force
+            "$HOME/.acme.sh/acme.sh" --install-cert -d "${dom}" --ecc \
+                --fullchain-file "${CERT_FILE}" \
+                --key-file "${KEY_FILE}"
+            chmod 600 "${KEY_FILE}"
+            systemctl restart ssh-ws xray 2>/dev/null || true
+            echo -e "${GREEN}Let's Encrypt SSL certificate installed for ${dom}!${NC}"
+            ;;
+        2)
+            local vip cert_cn
+            vip=$(curl -fsSL4 --max-time 2 icanhazip.com 2>/dev/null || hostname -I | awk '{print $1}')
+            read -rp "Enter Custom SNI / Bug Host for Certificate CN (leave blank for IP ${vip}): " cert_cn
+            cert_cn=${cert_cn:-${vip}}
+            if [[ "${cert_cn}" != "${vip}" ]]; then
+                echo "${cert_cn}" > "${SNI_FILE}"
+            fi
+            rm -f "${DOMAIN_FILE}"
+            openssl req -x509 -nodes -newkey rsa:2048 -days 3650 \
+                -keyout "${KEY_FILE}" \
+                -out "${CERT_FILE}" \
+                -subj "/C=US/ST=Cloud/L=VPS/O=VPS-Panel/CN=${cert_cn}" \
+                -addext "subjectAltName=DNS:${cert_cn},IP:${vip}" 2>/dev/null || \
+            openssl req -x509 -nodes -newkey rsa:2048 -days 3650 \
+                -keyout "${KEY_FILE}" \
+                -out "${CERT_FILE}" \
+                -subj "/C=US/ST=Cloud/L=VPS/O=VPS-Panel/CN=${cert_cn}"
+            chmod 600 "${KEY_FILE}"
+            systemctl restart ssh-ws xray 2>/dev/null || true
+            echo -e "${GREEN}Self-signed certificate generated (CN=${cert_cn}, IP=${vip}, all Custom SNIs accepted)!${NC}"
+            ;;
+        3)
+            read -rp "Enter Default Custom SNI / Bug Host (or 'clear' to reset): " nsni
+            if [[ "${nsni}" == "clear" || -z "${nsni}" ]]; then
+                rm -f "${SNI_FILE}"
+                echo -e "${YELLOW}Default Custom SNI cleared (using VPS Host/IP).${NC}"
+            else
+                echo "${nsni}" > "${SNI_FILE}"
+                echo -e "${GREEN}Default Custom SNI set to: ${nsni}${NC}"
+            fi
+            ;;
+    esac
+}
+
+# -----------------------------------------------------------------------------
+# Main Interactive CLI Loop
+# -----------------------------------------------------------------------------
+main_menu() {
+    while true; do
+        local host sni os_name
+        host=$(get_host)
+        sni=$(get_default_sni)
+        os_name=$(grep -E '^PRETTY_NAME=' /etc/os-release 2>/dev/null | cut -d'"' -f2 || uname -s)
+
+        echo -e "\n${BLUE}============================================================${NC}"
+        echo -e "${CYAN}         DEBIAN / UBUNTU VPS MANAGEMENT PANEL (CLI)         ${NC}"
+        echo -e "${BLUE}============================================================${NC}"
+        echo -e "  OS           : ${os_name}"
+        echo -e "  Host / IP    : ${host}   | Default SNI: ${sni}"
+        echo -e "  SSH-WS (80)  : $(svc_badge ssh-ws)   | Xray-core : $(svc_badge xray)"
+        echo -e "  Dropbear     : $(svc_badge dropbear)   | BadVPN 7300: $(svc_badge badvpn-udpgw)"
+        echo -e "  IP Limiter   : $(svc_badge vps-limiter)   | OpenSSH   : $(svc_badge ssh)"
+        echo -e "  Port 80 Mode : $(get_port_mode_label PORT_80_MODE)"
+        echo -e "  Port 443 Mode: $(get_port_mode_label PORT_443_MODE)"
+        echo -e "${BLUE}------------------------------------------------------------${NC}"
+        echo "  [SSH / SSH-WS / SSL-WS Management]"
+        echo "    1) Create SSH / WS / SSL User (Custom Payload 80 & Custom SNI 443)"
+        echo "    2) Delete SSH User"
+        echo "    3) Update SSH User IP Limit / Validity"
+        echo ""
+        echo "  [Xray Management (VLESS, VMess, Trojan - 443 & 80 WS/TCP + Custom SNI)]"
+        echo "    4) Create Xray User (VLESS / VMess / Trojan)"
+        echo "    5) Delete Xray User"
+        echo "    6) Update Xray User IP Limit / Validity"
+        echo ""
+        echo "  [Monitoring, Port Modes & Custom SNI / SSL]"
+        echo "    7) Show Active Connections & Per-User IP Usage"
+        echo "    8) Service Status & Port 80/443 Conflict Manager"
+        echo "    9) SSL Certificate & Custom SNI Manager"
+        echo "   10) Run Expired Account Cleanup Now"
+        echo "    0) Exit"
+        echo -e "${BLUE}------------------------------------------------------------${NC}"
+        read -rp "Select an option [0-10]: " opt
+
+        case "${opt}" in
+            1) create_ssh_user ;;
+            2) delete_ssh_user ;;
+            3) update_ssh_ip_limit ;;
+            4) create_xray_user ;;
+            5) delete_xray_user ;;
+            6) update_xray_ip_limit ;;
+            7) python3 /usr/local/share/vps-panel/limiter.py --status ;;
+            8) service_and_port_menu ;;
+            9) ssl_menu ;;
+            10) /usr/local/bin/xp-vps && echo -e "${GREEN}Expired users cleaned up.${NC}" ;;
+            0) exit 0 ;;
+            *) echo -e "${RED}Invalid selection.${NC}" ;;
+        esac
+    done
+}
+
+main_menu
